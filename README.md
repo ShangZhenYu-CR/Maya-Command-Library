@@ -12,12 +12,8 @@ Lightweight Maya commands and tools managed through Jira project **MCL**.
 
 | Tool | Jira | Purpose | Current attempt |
 | --- | --- | --- | --- |
-| [MCL Model Renamer](./tools/mcl-model-renamer/) | MCL-1 | Sequential naming plus two-model Face Count High/Low naming | 0.2.0 / V2 |
-
-## Structure
-
-Each maintained tool lives in its own directory under `tools/` and keeps its own source, README, changelog, launcher, and focused tests where practical.
+| [MCL Model Renamer](./tools/mcl-model-renamer/) | MCL-1 | Sequential, two-model High/Low, and multi-model spatial auto-pair naming | 0.3.0 / V3 |
 
 ## Delivery rule
 
-A feature is not considered accepted because code exists or tests pass. Fixed-version source/download, complete Maya launch code, usage instructions, verification scope, and explicit user acceptance are recorded in the corresponding MCL Jira item.
+A feature is not accepted because code exists or tests pass. Fixed-version source/download, launch code, usage, verification scope, and explicit user acceptance are recorded in MCL Jira.
