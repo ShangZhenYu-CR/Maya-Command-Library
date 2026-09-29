@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """MCL Proxy Pivot Matcher.
 
-MCL-2 V1.
+MCL-2 V1.1.
 
 Workflow:
 1. Put proxy meshes under the root group ``|proxy``.
 2. Select one or more final mesh transforms.
 3. Analyze conservative world-space Target -> Proxy matches.
-4. Apply Maya Match Pivots in one undo chunk.
+4. Apply Proxy T/R/S channel values while preserving geometry, then Match Pivots, in one undo chunk.
 
 Spatial thresholds intentionally mirror the fixed MCL-1 V3 pairing approach
 (commit 5c650ddea9b80c65769ff914e8cf1127c706208c), but this tool is standalone
@@ -282,6 +282,110 @@ def _selected_targets():
     return targets
 
 
+
+def _vector_attr(node, attr):
+    """Return a numeric double3 transform attribute as a 3-tuple."""
+    try:
+        value = cmds.getAttr(node + "." + attr)
+    except Exception as exc:
+        raise PivotMatchError(
+            "Could not read {} from '{}': {}".format(attr, leaf_name(node), exc)
+        )
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise PivotMatchError(
+            "Unexpected {} value on '{}': {}".format(attr, leaf_name(node), value)
+        )
+    return tuple(float(component) for component in value)
+
+
+def _transform_values(node):
+    return {
+        "translate": _vector_attr(node, "translate"),
+        "rotate": _vector_attr(node, "rotate"),
+        "scale": _vector_attr(node, "scale"),
+    }
+
+
+def _validate_transform_channels_writable(node):
+    for attr in (
+        "translateX", "translateY", "translateZ",
+        "rotateX", "rotateY", "rotateZ",
+        "scaleX", "scaleY", "scaleZ",
+    ):
+        try:
+            settable = cmds.getAttr(node + "." + attr, settable=True)
+        except Exception as exc:
+            raise PivotMatchError(
+                "Could not inspect transform channel '{}.{}': {}".format(
+                    leaf_name(node), attr, exc
+                )
+            )
+        if not settable:
+            raise PivotMatchError(
+                "Target '{}.{}' is locked or connected; coordinate values cannot be synchronized safely.".format(
+                    leaf_name(node), attr
+                )
+            )
+
+
+def _values_close(first, second, tolerance=1e-6):
+    return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(first, second))
+
+
+def _sync_transform_values_preserve_geometry(target, proxy):
+    """Match Proxy T/R/S channel values while compensating geometry in world space.
+
+    Maya's move/rotate/scale preserveGeometryPosition option applies the inverse
+    transform to geometry points. preserveChildPosition keeps child transforms in
+    their previous world-space positions.
+    """
+    _validate_transform_channels_writable(target)
+    desired = _transform_values(proxy)
+
+    cmds.move(
+        desired["translate"][0],
+        desired["translate"][1],
+        desired["translate"][2],
+        target,
+        absolute=True,
+        localSpace=True,
+        preserveGeometryPosition=True,
+        preserveChildPosition=True,
+    )
+    cmds.rotate(
+        desired["rotate"][0],
+        desired["rotate"][1],
+        desired["rotate"][2],
+        target,
+        absolute=True,
+        objectSpace=True,
+        preserveGeometryPosition=True,
+        preserveChildPosition=True,
+    )
+    cmds.scale(
+        desired["scale"][0],
+        desired["scale"][1],
+        desired["scale"][2],
+        target,
+        absolute=True,
+        localSpace=True,
+        preserveGeometryPosition=True,
+        preserveChildPosition=True,
+    )
+
+    actual = _transform_values(target)
+    for attr in ("translate", "rotate", "scale"):
+        if not _values_close(actual[attr], desired[attr]):
+            raise PivotMatchError(
+                "Maya did not set {} on '{}' to the Proxy values. Use Undo immediately.".format(
+                    attr, leaf_name(target)
+                )
+            )
+    return desired
+
+
 def _world_bbox(node):
     try:
         bounds = cmds.exactWorldBoundingBox(node)
@@ -294,7 +398,11 @@ def _world_bbox(node):
 
 
 def _record(node):
-    return {"node": node, "bounds": _world_bbox(node)}
+    return {
+        "node": node,
+        "bounds": _world_bbox(node),
+        "transform": _transform_values(node),
+    }
 
 
 def _round_bounds(bounds):
@@ -303,11 +411,23 @@ def _round_bounds(bounds):
 
 def _analysis_signature(target_records, proxy_records, pairs):
     targets = tuple(sorted(
-        (record["node"], _round_bounds(record["bounds"]))
+        (
+            record["node"],
+            _round_bounds(record["bounds"]),
+            tuple(round(value, 6) for value in record["transform"]["translate"]),
+            tuple(round(value, 6) for value in record["transform"]["rotate"]),
+            tuple(round(value, 6) for value in record["transform"]["scale"]),
+        )
         for record in target_records
     ))
     proxies = tuple(sorted(
-        (record["node"], _round_bounds(record["bounds"]))
+        (
+            record["node"],
+            _round_bounds(record["bounds"]),
+            tuple(round(value, 6) for value in record["transform"]["translate"]),
+            tuple(round(value, 6) for value in record["transform"]["rotate"]),
+            tuple(round(value, 6) for value in record["transform"]["scale"]),
+        )
         for record in proxy_records
     ))
     mapping = tuple(
@@ -352,7 +472,7 @@ def analysis_lines(analysis):
 
 
 def apply_matches(expected_signature):
-    """Apply Match Pivots for a previously analyzed selection."""
+    """Apply Proxy coordinate values + Match Pivots for a previously analyzed selection."""
     if expected_signature is None:
         raise PivotMatchError("Analyze the selection before applying.")
 
@@ -372,9 +492,12 @@ def apply_matches(expected_signature):
         for pair in analysis["pairs"]:
             target = pair["target"]["node"]
             proxy = pair["proxy"]["node"]
-            # Autodesk Maya Match Pivots equivalent:
-            # only the pivot operation is requested; position/rotation/scale matching
-            # is intentionally not enabled.
+
+            # V1.1: synchronize visible Channel Box T/R/S values from Proxy while
+            # preserving final geometry (and child transforms) in world space.
+            _sync_transform_values_preserve_geometry(target, proxy)
+
+            # Then match rotate/scale pivot positions/orientation.
             cmds.matchTransform(target, proxy, pivots=True)
             applied += 1
         return {"matched_count": applied, "pairs": analysis["pairs"]}
@@ -467,7 +590,7 @@ def show():
             invalidate()
             _set_status(
                 status,
-                "Matched pivots for {} final model(s).".format(result["matched_count"]),
+                "Matched pivots + T/R/S values for {} final model(s).".format(result["matched_count"]),
                 True,
             )
         except PivotMatchError as exc:
@@ -476,7 +599,7 @@ def show():
 
     cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
     cmds.button(label="Analyze", height=38, command=analyze)
-    cmds.button(label="Apply Match Pivots", height=38, command=apply)
+    cmds.button(label="Apply Pivots + Coordinates", height=38, command=apply)
     cmds.setParent(root)
     cmds.text(
         label="If Apply reports a partial failure, use one Undo immediately.",
