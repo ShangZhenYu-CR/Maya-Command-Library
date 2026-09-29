@@ -15,7 +15,7 @@ def bounds(cx, cy, cz, sx=2.0, sy=2.0, sz=2.0):
 
 
 class FakeMaya:
-    def __init__(self, targets, proxies, target_boxes, proxy_boxes, fail_target=None):
+    def __init__(self, targets, proxies, target_boxes, proxy_boxes, transform_values, fail_target=None):
         self.selection = list(targets)
         self.proxy_root = "|proxy"
         self.targets = set(targets)
@@ -27,7 +27,18 @@ class FakeMaya:
         self.boxes = {}
         self.boxes.update(target_boxes)
         self.boxes.update(proxy_boxes)
+        self.values = {
+            node: {
+                "translate": tuple(data["translate"]),
+                "rotate": tuple(data["rotate"]),
+                "scale": tuple(data["scale"]),
+            }
+            for node, data in transform_values.items()
+        }
         self.match_calls = []
+        self.move_calls = []
+        self.rotate_calls = []
+        self.scale_calls = []
         self.undo_calls = []
         self.fail_target = fail_target
 
@@ -55,9 +66,14 @@ class FakeMaya:
             return "mesh"
         return "unknown"
 
-    def getAttr(self, attr, **kwargs):
+    def getAttr(self, attr, settable=False, **kwargs):
         if attr.endswith(".intermediateObject"):
             return False
+        if settable:
+            return True
+        node, plug = attr.rsplit(".", 1)
+        if plug in ("translate", "rotate", "scale"):
+            return [self.values[node][plug]]
         return None
 
     def referenceQuery(self, node, **kwargs):
@@ -72,11 +88,22 @@ class FakeMaya:
     def undoInfo(self, **kwargs):
         self.undo_calls.append(kwargs)
 
+    def move(self, x, y, z, target, **kwargs):
+        self.move_calls.append((target, (x, y, z), kwargs))
+        self.values[target]["translate"] = (x, y, z)
+
+    def rotate(self, x, y, z, target, **kwargs):
+        self.rotate_calls.append((target, (x, y, z), kwargs))
+        self.values[target]["rotate"] = (x, y, z)
+
+    def scale(self, x, y, z, target, **kwargs):
+        self.scale_calls.append((target, (x, y, z), kwargs))
+        self.values[target]["scale"] = (x, y, z)
+
     def matchTransform(self, target, proxy, **kwargs):
         if target == self.fail_target:
             raise RuntimeError("simulated match failure")
         self.match_calls.append((target, proxy, kwargs))
-
 
 def setup(fake):
     tool.cmds = fake
@@ -107,7 +134,17 @@ def make_fake(order=None, fail_target=None):
         "|proxy|ProxyB": bounds(10, 0, 0),
         "|proxy|Unused": bounds(100, 0, 0),
     }
-    return FakeMaya(targets, proxies, target_boxes, proxy_boxes, fail_target=fail_target)
+    transform_values = {
+        "|FinalA": {"translate": (9, 9, 9), "rotate": (1, 2, 3), "scale": (2, 2, 2)},
+        "|FinalB": {"translate": (8, 8, 8), "rotate": (4, 5, 6), "scale": (3, 3, 3)},
+        "|proxy|ProxyA": {"translate": (1, 2, 3), "rotate": (10, 20, 30), "scale": (1, 1, 1)},
+        "|proxy|ProxyB": {"translate": (4, 5, 6), "rotate": (0, 90, 0), "scale": (1, 1, 1)},
+        "|proxy|Unused": {"translate": (100, 0, 0), "rotate": (0, 0, 0), "scale": (1, 1, 1)},
+    }
+    return FakeMaya(
+        targets, proxies, target_boxes, proxy_boxes, transform_values,
+        fail_target=fail_target,
+    )
 
 
 def test_metric_accepts_close_and_rejects_far_or_large_size_mismatch():
@@ -161,12 +198,31 @@ def test_selection_order_does_not_change_signature():
     assert first["signature"] == second["signature"]
 
 
-def test_apply_uses_pivots_only_and_one_undo_chunk():
+def test_apply_syncs_trs_and_pivots_in_one_undo_chunk():
     fake = make_fake()
     setup(fake)
     analysis = tool.analyze_matches()
     result = tool.apply_matches(analysis["signature"])
     assert result["matched_count"] == 2
+
+    assert fake.values["|FinalA"] == fake.values["|proxy|ProxyA"]
+    assert fake.values["|FinalB"] == fake.values["|proxy|ProxyB"]
+
+    preserve_flags = {
+        "absolute": True,
+        "preserveGeometryPosition": True,
+        "preserveChildPosition": True,
+    }
+    assert fake.move_calls[0] == (
+        "|FinalA", (1.0, 2.0, 3.0), {**preserve_flags, "localSpace": True}
+    )
+    assert fake.rotate_calls[0] == (
+        "|FinalA", (10.0, 20.0, 30.0), {**preserve_flags, "objectSpace": True}
+    )
+    assert fake.scale_calls[0] == (
+        "|FinalA", (1.0, 1.0, 1.0), {**preserve_flags, "localSpace": True}
+    )
+
     assert fake.match_calls == [
         ("|FinalA", "|proxy|ProxyA", {"pivots": True}),
         ("|FinalB", "|proxy|ProxyB", {"pivots": True}),
@@ -180,6 +236,15 @@ def test_changed_world_bounds_requires_reanalysis():
     setup(fake)
     analysis = tool.analyze_matches()
     fake.boxes["|FinalA"] = bounds(0.20, 0, 0)
+    with pytest.raises(tool.PivotMatchError, match="Analyze again"):
+        tool.apply_matches(analysis["signature"])
+
+
+def test_changed_proxy_coordinate_values_requires_reanalysis():
+    fake = make_fake()
+    setup(fake)
+    analysis = tool.analyze_matches()
+    fake.values["|proxy|ProxyA"]["translate"] = (7, 8, 9)
     with pytest.raises(tool.PivotMatchError, match="Analyze again"):
         tool.apply_matches(analysis["signature"])
 
@@ -215,6 +280,9 @@ def test_partial_failure_closes_chunk_and_reports_undo():
 def test_static_safety_contract():
     source = (ROOT / "mcl_proxy_pivot_matcher.py").read_text(encoding="utf-8")
     assert "matchTransform(target, proxy, pivots=True)" in source
+    assert "preserveGeometryPosition=True" in source
+    assert "preserveChildPosition=True" in source
+    assert "_sync_transform_values_preserve_geometry" in source
     for token in (
         "deleteHistory",
         "makeIdentity",
