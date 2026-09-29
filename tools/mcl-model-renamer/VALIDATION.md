@@ -1,95 +1,38 @@
-# Validation — MCL-1 V2
+# Validation — MCL-1 V3
 
 Date: 2026-09-29  
-Current attempt: MCL Model Renamer 0.2.0 / V2  
-Baseline: accepted V1 Commit `1ccb910e71d5210b4e7ccedf2c4c12cba81ec572`  
-Branch: `MCL-1-model-renamer-v2`
+Current attempt: MCL Model Renamer 0.3.0 / V3  
+Baseline: accepted V2 Commit `b77f098f18f93568508d40a243faead7ef5d0b39`  
+Branch: `MCL-1-model-renamer-v3`
 
-## Host-independent checks
+## Baseline preservation
 
-Environment:
+V3 is a companion extension. The accepted V2 file `mcl_model_renamer.py` is intentionally not modified by V3. GitHub V2→V3 diff/read-back is used to verify this.
 
-```text
-Python 3.13.5
-```
+## V3 host-independent checks
 
-Commands executed against the V2 implementation content:
-
-```bash
-python -m compileall -q .
-python -m pytest -q
-```
-
-Observed result:
+Environment: Python 3.13.5 / pytest 9.0.2.
 
 ```text
-.............................                                            [100%]
-29 passed in 0.05s
+python -m compileall -q mcl_model_renamer_v3.py
+pytest -q
+........... [100%]
+11 passed
 ```
 
-## V1 regression coverage
+The V3 tests use a focused V2 API test double for the already-accepted helper contract. They do not replace V2 acceptance evidence or real Maya verification.
 
-- `{Base}_{Index}_{Role}` generation.
-- Two-digit minimum Index and 99 → 100.
-- Namespace-preserving leaf target construction.
-- Invalid Base / Role / Index rejection.
-- V1 Rename Selected UI entry retained.
-- Reference, lock, non-intermediate Mesh, exact-name conflict, and no-auto-suffix safeguards retained.
-
-## V2 logic coverage
-
-- `{Base}_{Index}_high` / `{Base}_{Index}_low` pair name generation.
-- First model higher Face Count → first is high.
-- Second model higher Face Count → second is high.
-- Equal Face Count raises a user-facing error.
-- Negative invalid Face Count is rejected.
-
-## Fake Maya transaction coverage
-
-A focused fake `maya.cmds` host verifies:
-
-1. Successful pair rename assigns the correct High / Low roles and advances Index once.
-2. Equal Face Count performs no Rename calls.
-3. Existing target-name conflict performs no Rename calls.
-4. Simulated failure on the second rename rolls the first rename back to its original name.
-5. Pair operation opens and closes one Undo chunk.
-
-This fake-host evidence validates control flow only; it is not Autodesk Maya host evidence.
-
-## Static safety coverage
-
-Confirmed present:
-
-- `referenceQuery`
-- `lockNode`
-- `noIntermediate=True`
-- `polyEvaluate(..., face=True)`
-- pair preflight
-- exact-name verification
-- pair rollback path
-- separate pair Undo chunk
-
-Confirmed absent:
-
-- History deletion
-- Freeze Transform
-- `polySoftEdge`
-- `optionVar` writes
+Covered: center/size metric, far/size mismatch rejection, selection-order-independent pairing, four-model/two-pair Apply, changed-selection and changed-bounds re-analysis, odd selection, equal Face Count, ambiguous cluster, mid-batch rollback, Analyze/Apply signature contract, and absence of destructive/global Maya operations.
 
 ## Pending real Maya host verification
 
-The following remain unverified in Autodesk Maya:
+- V3 unified window and preview readability;
+- real multi-pair spatial matching;
+- stable numbering under changed selection order;
+- ambiguous/unpaired blocking;
+- Analyze → move a model → Apply stale-analysis rejection;
+- whole-batch Undo;
+- V1/V2 buttons still work through the V3 window;
+- specific Maya-version compatibility.
 
-- V2 UI rendering and callbacks.
-- Face Count values returned for real selected transforms.
-- Higher/lower assignment with real polygon meshes.
-- Equal Face Count stop behavior.
-- Pair name conflicts in a real scene.
-- Referenced / Locked behavior.
-- Namespace behavior.
-- Unexpected second-rename failure and rollback in Maya.
-- One-step Undo of the pair.
-- V1 single-mode regression in the real host.
-- Compatibility with any specific Maya version.
-
-This document records test evidence only. It is not user acceptance.
+This is verification evidence, not user acceptance.
