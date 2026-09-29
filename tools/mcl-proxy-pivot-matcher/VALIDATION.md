@@ -57,3 +57,8 @@ The 13-pass result was executed locally against the V1.2 implementation before G
 - specific Maya-version compatibility
 
 This is verification evidence, not user acceptance.
+
+
+## V1.3 naming option
+
+Local regression after adding optional Sync Names: 19 passed. Sync Names defaults Off; matched Final can take the Proxy base name; matched Proxy uses configurable prefix `synced_`; conflicts and namespaces are blocked before modification. Maya host verification remains pending.
