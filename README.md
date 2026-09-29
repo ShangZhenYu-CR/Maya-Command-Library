@@ -12,7 +12,7 @@ Lightweight Maya commands and tools managed through Jira project **MCL**.
 
 | Tool | Jira | Purpose | Current attempt |
 | --- | --- | --- | --- |
-| [MCL Model Renamer](./tools/mcl-model-renamer/) | MCL-1 | Sequential Maya model naming with `{Base}_{Index}_{Role}` | 0.1.0 / V1 |
+| [MCL Model Renamer](./tools/mcl-model-renamer/) | MCL-1 | Sequential naming plus two-model Face Count High/Low naming | 0.2.0 / V2 |
 
 ## Structure
 
