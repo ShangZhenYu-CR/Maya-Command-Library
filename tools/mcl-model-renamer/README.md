@@ -1,7 +1,7 @@
 # MCL Model Renamer — V3
 
 Jira: **MCL-1**  
-Current attempt: **0.3.0 / V3**  
+Current attempt: **0.3.1 / V3**  
 Last accepted result: **0.2.0 / V2 — `b77f098f18f93568508d40a243faead7ef5d0b39`**
 
 V3 is implemented as an extension beside the accepted V2 module. The accepted `mcl_model_renamer.py` is intentionally left unchanged; V3 imports and reuses its V1/V2 validation, Face Count, conflict, exact-rename, and rollback-safe helpers.
@@ -37,17 +37,27 @@ Conservative defaults:
 - average size-mismatch limit: `0.35`;
 - if the two best candidate scores differ by `0.05` or less, the object is ambiguous.
 
-Any ambiguous, unpaired, too-distant, size-mismatched, equal-Face-Count, or target-conflict object blocks Apply. Use V2 manually for exceptional pairs rather than forcing a guess.
+Any ambiguous, unpaired, too-distant, size-mismatched, or equal-Face-Count object blocks Apply. Target-name conflicts are treated specially: by default, a target name occupied by another **selected** object is allowed because that object participates in the same batch; a target name occupied by an **unselected** object still blocks Apply.
 
 ## Stable numbering
 
 Resolved pairs are sorted by average world center using `X → Z → Y`, so numbering is independent of Maya Selection Order. Within each pair, Face Count still decides High / Low.
 
+## Selected name reuse
+
+**Allow Selected Name Reuse** is enabled by default.
+
+When enabled, selected objects are allowed to occupy names that are targets of the same V3 batch. Apply first moves every participating selected object to a unique temporary name, then writes the final names. This safely handles name swaps and cycles without accepting Maya auto-suffixes.
+
+Unselected objects are never ignored: if an unselected scene object already owns a final target name, Analyze marks that pair as a target conflict and Apply remains blocked.
+
+Turn the option off to restore strict behavior where even selected objects occupying target names are treated as conflicts.
+
 ## Apply safety
 
-Analyze stores a signature for selected DAG paths, Face Counts, rounded world bounds, Base/Index, and targets. Apply re-runs analysis. If relevant selection/geometry state or naming inputs changed, Apply stops and asks for Analyze again.
+Analyze stores a signature for selected DAG paths, Face Counts, rounded world bounds, Base/Index, targets, and the selected-name-reuse setting. Apply re-runs analysis. If relevant selection/geometry state, naming inputs, or the conflict setting changed, Apply stops and asks for Analyze again.
 
-The full V3 batch uses one Maya Undo chunk target. If an unexpected rename fails midway, V3 attempts to restore already-renamed models in reverse order.
+The full V3 batch uses one Maya Undo chunk target. If an unexpected rename fails midway, V3 performs a two-phase best-effort rollback to avoid original names blocking each other.
 
 ## Installation
 
