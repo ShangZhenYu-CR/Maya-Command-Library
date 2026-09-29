@@ -67,6 +67,7 @@ def test_v3_source_contains_analyze_preview_apply_contract():
     for token in ('exactWorldBoundingBox', 'Analyze Auto Pairs', 'Apply Auto Pairs', 'expected_signature', 'UNDO_CHUNK_AUTO'):
         assert token in source
 
+
 def test_v3_source_does_not_change_global_or_destructive_maya_state():
     source = (Path(__file__).resolve().parents[1] / 'mcl_model_renamer_v3.py').read_text(encoding='utf-8')
     for token in ('deleteHistory', 'makeIdentity', 'polySoftEdge', 'optionVar(', 'trackSelectionOrder'):
