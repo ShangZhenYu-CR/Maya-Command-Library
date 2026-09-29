@@ -1,11 +1,14 @@
 # Tests
 
-`test_pure_logic.py` runs outside Maya and checks deterministic naming/index/namespace behavior.
-
-`test_maya_contract_static.py` checks important safety contracts in source text. It is not a substitute for real Maya host verification.
+- `test_pure_logic.py`: deterministic V1 naming plus V2 pair-name / Face Count classification.
+- `test_maya_contract_static.py`: source-level safety and scope contracts.
+- `test_pair_fake_maya.py`: focused fake `maya.cmds` transaction tests for pair success, equal Face Count rejection, conflict rejection, and rollback.
 
 Run from the tool directory:
 
 ```bash
+python -m compileall -q .
 python -m pytest -q
 ```
+
+Fake-host and static tests do not replace real Autodesk Maya verification.
