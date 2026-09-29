@@ -1,4 +1,5 @@
 import sys
+import math
 from pathlib import Path
 import pytest
 
@@ -32,15 +33,62 @@ class FakeMaya:
                 "translate": tuple(data["translate"]),
                 "rotate": tuple(data["rotate"]),
                 "scale": tuple(data["scale"]),
+                "rotateOrder": int(data.get("rotateOrder", 0)),
             }
             for node, data in transform_values.items()
         }
+        self.offset_parent = {node: tool._identity_matrix() for node in self.targets | self.proxies}
         self.match_calls = []
-        self.move_calls = []
-        self.rotate_calls = []
-        self.scale_calls = []
+        self.set_calls = []
         self.undo_calls = []
         self.fail_target = fail_target
+
+    def _rotation_matrix_xyz(self, rotate):
+        rx, ry, rz = [math.radians(v) for v in rotate]
+        cx, sx = math.cos(rx), math.sin(rx)
+        cy, sy = math.cos(ry), math.sin(ry)
+        cz, sz = math.cos(rz), math.sin(rz)
+        mx = (
+            1,0,0,0,
+            0,cx,sx,0,
+            0,-sx,cx,0,
+            0,0,0,1,
+        )
+        my = (
+            cy,0,-sy,0,
+            0,1,0,0,
+            sy,0,cy,0,
+            0,0,0,1,
+        )
+        mz = (
+            cz,sz,0,0,
+            -sz,cz,0,0,
+            0,0,1,0,
+            0,0,0,1,
+        )
+        return tool._matrix_multiply(tool._matrix_multiply(mx, my), mz)
+
+    def _local_matrix(self, node):
+        data = self.values[node]
+        sx, sy, sz = data["scale"]
+        scale = (
+            sx,0,0,0,
+            0,sy,0,0,
+            0,0,sz,0,
+            0,0,0,1,
+        )
+        rot = self._rotation_matrix_xyz(data["rotate"])
+        tx, ty, tz = data["translate"]
+        trans = (
+            1,0,0,0,
+            0,1,0,0,
+            0,0,1,0,
+            tx,ty,tz,1,
+        )
+        return tool._matrix_multiply(tool._matrix_multiply(scale, rot), trans)
+
+    def _world_matrix(self, node):
+        return tool._matrix_multiply(self._local_matrix(node), self.offset_parent[node])
 
     def ls(self, value=None, selection=False, long=False, flatten=False, **kwargs):
         if selection:
@@ -52,11 +100,13 @@ class FakeMaya:
         return []
 
     def listRelatives(self, node, shapes=False, fullPath=False, allDescendents=False,
-                      type=None, **kwargs):
+                      type=None, parent=False, **kwargs):
         if node == self.proxy_root and allDescendents and type == "transform":
             return sorted(self.proxies)
         if shapes:
             return list(self.shapes.get(node, []))
+        if parent:
+            return []
         return []
 
     def nodeType(self, node):
@@ -66,15 +116,52 @@ class FakeMaya:
             return "mesh"
         return "unknown"
 
+    def objExists(self, value):
+        if value.endswith(".offsetParentMatrix"):
+            node = value.rsplit(".", 1)[0]
+            return node in self.transforms and node != self.proxy_root
+        return value in self.transforms or value.endswith("|Shape")
+
     def getAttr(self, attr, settable=False, **kwargs):
         if attr.endswith(".intermediateObject"):
             return False
+        node, plug = attr.rsplit(".", 1)
         if settable:
             return True
-        node, plug = attr.rsplit(".", 1)
         if plug in ("translate", "rotate", "scale"):
             return [self.values[node][plug]]
+        if plug in (
+            "translateX", "translateY", "translateZ",
+            "rotateX", "rotateY", "rotateZ",
+            "scaleX", "scaleY", "scaleZ",
+        ):
+            base = {"t": "translate", "r": "rotate", "s": "scale"}[plug[0]]
+            axis = {"X": 0, "Y": 1, "Z": 2}[plug[-1]]
+            return self.values[node][base][axis]
+        if plug == "rotateOrder":
+            return self.values[node]["rotateOrder"]
+        if plug == "matrix":
+            return self._local_matrix(node)
+        if plug == "worldMatrix[0]":
+            return self._world_matrix(node)
+        if plug == "offsetParentMatrix":
+            return self.offset_parent[node]
         return None
+
+    def setAttr(self, attr, *values, **kwargs):
+        node, plug = attr.rsplit(".", 1)
+        self.set_calls.append((attr, values, kwargs))
+        if plug in ("translate", "rotate", "scale"):
+            self.values[node][plug] = tuple(float(v) for v in values[:3])
+            return
+        if plug == "rotateOrder":
+            self.values[node]["rotateOrder"] = int(values[0])
+            return
+        if plug == "offsetParentMatrix":
+            matrix = values[0] if len(values) == 1 and isinstance(values[0], (list, tuple)) else values
+            self.offset_parent[node] = tool._matrix16(matrix)
+            return
+        raise RuntimeError("unsupported setAttr {}".format(attr))
 
     def referenceQuery(self, node, **kwargs):
         return False
@@ -87,18 +174,6 @@ class FakeMaya:
 
     def undoInfo(self, **kwargs):
         self.undo_calls.append(kwargs)
-
-    def move(self, x, y, z, target, **kwargs):
-        self.move_calls.append((target, (x, y, z), kwargs))
-        self.values[target]["translate"] = (x, y, z)
-
-    def rotate(self, x, y, z, target, **kwargs):
-        self.rotate_calls.append((target, (x, y, z), kwargs))
-        self.values[target]["rotate"] = (x, y, z)
-
-    def scale(self, x, y, z, target, **kwargs):
-        self.scale_calls.append((target, (x, y, z), kwargs))
-        self.values[target]["scale"] = (x, y, z)
 
     def matchTransform(self, target, proxy, **kwargs):
         if target == self.fail_target:
@@ -198,30 +273,26 @@ def test_selection_order_does_not_change_signature():
     assert first["signature"] == second["signature"]
 
 
-def test_apply_syncs_trs_and_pivots_in_one_undo_chunk():
+def test_apply_syncs_trs_and_pivots_preserving_world_matrix():
     fake = make_fake()
     setup(fake)
+    before_a = fake._world_matrix("|FinalA")
+    before_b = fake._world_matrix("|FinalB")
+
     analysis = tool.analyze_matches()
     result = tool.apply_matches(analysis["signature"])
     assert result["matched_count"] == 2
 
-    assert fake.values["|FinalA"] == fake.values["|proxy|ProxyA"]
-    assert fake.values["|FinalB"] == fake.values["|proxy|ProxyB"]
+    assert fake.values["|FinalA"]["translate"] == fake.values["|proxy|ProxyA"]["translate"]
+    assert fake.values["|FinalA"]["rotate"] == fake.values["|proxy|ProxyA"]["rotate"]
+    assert fake.values["|FinalA"]["scale"] == fake.values["|proxy|ProxyA"]["scale"]
+    assert fake.values["|FinalB"]["translate"] == fake.values["|proxy|ProxyB"]["translate"]
+    assert fake.values["|FinalB"]["rotate"] == fake.values["|proxy|ProxyB"]["rotate"]
+    assert fake.values["|FinalB"]["scale"] == fake.values["|proxy|ProxyB"]["scale"]
 
-    preserve_flags = {
-        "absolute": True,
-        "preserveGeometryPosition": True,
-        "preserveChildPosition": True,
-    }
-    assert fake.move_calls[0] == (
-        "|FinalA", (1.0, 2.0, 3.0), {**preserve_flags, "localSpace": True}
-    )
-    assert fake.rotate_calls[0] == (
-        "|FinalA", (10.0, 20.0, 30.0), {**preserve_flags, "objectSpace": True}
-    )
-    assert fake.scale_calls[0] == (
-        "|FinalA", (1.0, 1.0, 1.0), {**preserve_flags, "localSpace": True}
-    )
+    assert tool._matrices_close(fake._world_matrix("|FinalA"), before_a)
+    assert tool._matrices_close(fake._world_matrix("|FinalB"), before_b)
+    assert not tool._matrices_close(fake.offset_parent["|FinalA"], tool._identity_matrix())
 
     assert fake.match_calls == [
         ("|FinalA", "|proxy|ProxyA", {"pivots": True}),
@@ -229,6 +300,33 @@ def test_apply_syncs_trs_and_pivots_in_one_undo_chunk():
     ]
     assert fake.undo_calls[0] == {"openChunk": True, "chunkName": tool.UNDO_CHUNK}
     assert fake.undo_calls[-1] == {"closeChunk": True}
+
+
+def test_matrix_rebalance_formula_preserves_world_with_parent_matrix():
+    local = (
+        2,0,0,0,
+        0,3,0,0,
+        0,0,4,0,
+        5,6,7,1,
+    )
+    parent = (
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        10,20,30,1,
+    )
+    world = (
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        100,200,300,1,
+    )
+    compensation = tool._matrix_multiply(
+        tool._matrix_multiply(tool._matrix_inverse(local), world),
+        tool._matrix_inverse(parent),
+    )
+    rebuilt = tool._matrix_multiply(tool._matrix_multiply(local, compensation), parent)
+    assert tool._matrices_close(rebuilt, world)
 
 
 def test_changed_world_bounds_requires_reanalysis():
@@ -280,9 +378,10 @@ def test_partial_failure_closes_chunk_and_reports_undo():
 def test_static_safety_contract():
     source = (ROOT / "mcl_proxy_pivot_matcher.py").read_text(encoding="utf-8")
     assert "matchTransform(target, proxy, pivots=True)" in source
-    assert "preserveGeometryPosition=True" in source
-    assert "preserveChildPosition=True" in source
-    assert "_sync_transform_values_preserve_geometry" in source
+    assert "offsetParentMatrix" in source
+    assert "_rebalance_transform_values_with_offset_parent_matrix" in source
+    assert \'cmds.setAttr(target + ".offsetParentMatrix"\' in source
+    assert "preserveGeometryPosition=True" not in source
     for token in (
         "deleteHistory",
         "makeIdentity",
