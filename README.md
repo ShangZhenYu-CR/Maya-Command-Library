@@ -8,6 +8,12 @@ Lightweight Maya commands and tools managed through Jira project **MCL**.
 - Project key: `MCL`
 - Workflow: `MCL-WORKFLOW-V1`
 
+## Tool catalog
+
+| Tool | Jira | Purpose | Current attempt |
+| --- | --- | --- | --- |
+| [MCL Model Renamer](./tools/mcl-model-renamer/) | MCL-1 | Sequential Maya model naming with `{Base}_{Index}_{Role}` | 0.1.0 / V1 |
+
 ## Structure
 
 Each maintained tool lives in its own directory under `tools/` and keeps its own source, README, changelog, launcher, and focused tests where practical.
