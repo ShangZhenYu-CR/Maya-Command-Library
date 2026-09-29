@@ -1,145 +1,82 @@
-# MCL Model Renamer — V2
+# MCL Model Renamer — V3
 
 Jira: **MCL-1**  
-Current attempt: **0.2.0 / V2**  
-Last accepted result: **0.1.0 / V1 — `1ccb910e71d5210b4e7ccedf2c4c12cba81ec572`**
+Current attempt: **0.3.0 / V3**  
+Last accepted result: **0.2.0 / V2 — `b77f098f18f93568508d40a243faead7ef5d0b39`**
 
-## Purpose
+V3 is implemented as an extension beside the accepted V2 module. The accepted `mcl_model_renamer.py` is intentionally left unchanged; V3 imports and reuses its V1/V2 validation, Face Count, conflict, exact-rename, and rollback-safe helpers.
 
-Two naming modes share the same Base and Index.
+## Modes in the V3 window
 
-### Single mode — V1 retained
+- **Rename Selected** — V1 single-model naming.
+- **Rename Pair High / Low** — V2 two-model Face Count naming.
+- **Analyze Auto Pairs** — V3 read-only multi-model analysis.
+- **Apply Auto Pairs** — V3 batch rename after a valid preview.
 
-```text
-{Base}_{Index}_{Role}
-```
-
-Example:
-
-```text
-A_01_low
-A_02_low
-A_03_low
-```
-
-### Pair High / Low mode — V2
-
-Select exactly two local Mesh transforms. The tool compares total polygon Face Count across non-intermediate Mesh shapes:
-
-- higher Face Count → `{Base}_{Index}_high`
-- lower Face Count → `{Base}_{Index}_low`
-- both use the same Index
-- Index advances once only after both exact renames succeed
-- equal Face Count stops without renaming
-
-Example:
+## V3 workflow
 
 ```text
-A_05_high
-A_05_low
-next index -> 06
+Select multiple candidate meshes
+        ↓
+Analyze Auto Pairs
+        ↓
+Preview resolved pairs / UNRESOLVED items
+        ↓
+Apply Auto Pairs
 ```
 
-## V2 UI
+Analyze never renames scene nodes.
 
-- Base Name
-- Index
-- Role (single mode only)
-- Single Preview
-- Pair Preview
-- **Rename Selected** — V1 single mode
-- **Rename Pair High / Low** — V2 pair mode
-- **Reset to 01**
+## Pairing rules
 
-## Pair validation and safety
+V3 compares world-space bounding boxes using center proximity and bounding-box size similarity. Only **mutual best matches** are accepted automatically.
 
-Before changing the scene, V2 requires:
+Conservative defaults:
 
-- exactly two distinct selected items;
-- both are local Transform nodes;
-- both contain at least one non-intermediate Mesh shape;
-- neither is referenced;
-- neither is locked;
-- Face Count values can be read;
-- Face Counts are different;
-- both exact target names are free.
+- normalized center-distance limit: `0.25` of average pair bounding-box diagonal;
+- average size-mismatch limit: `0.35`;
+- if the two best candidate scores differ by `0.05` or less, the object is ambiguous.
 
-If any preflight fails, neither model is renamed and Index does not advance.
+Any ambiguous, unpaired, too-distant, size-mismatched, equal-Face-Count, or target-conflict object blocks Apply. Use V2 manually for exceptional pairs rather than forcing a guess.
 
-If the first model has already been renamed and the second rename unexpectedly fails, the tool attempts to restore the first model automatically. If rollback is incomplete, the error explicitly tells the user to use Maya Undo immediately.
+## Stable numbering
 
-Maya automatic suffixes such as `A_01_high1` are not accepted.
+Resolved pairs are sorted by average world center using `X → Z → Y`, so numbering is independent of Maya Selection Order. Within each pair, Face Count still decides High / Low.
 
-## Namespace behavior
+## Apply safety
 
-The existing namespace of each Transform is preserved; only the leaf name changes.
+Analyze stores a signature for selected DAG paths, Face Counts, rounded world bounds, Base/Index, and targets. Apply re-runs analysis. If relevant selection/geometry state or naming inputs changed, Apply stops and asks for Analyze again.
 
-Example:
-
-```text
-characterA:pCube1 -> characterA:A_01_high
-characterB:pCube2 -> characterB:A_01_low
-```
+The full V3 batch uses one Maya Undo chunk target. If an unexpected rename fails midway, V3 attempts to restore already-renamed models in reverse order.
 
 ## Installation
 
-Copy these files into a Maya scripts directory:
+Copy these files from the same fixed V3 result into Maya `scripts`:
 
 ```text
 <Documents>/maya/scripts/
-├─ mcl_model_renamer.py
-└─ SHELF_LAUNCHER.py
+├─ mcl_model_renamer.py       # accepted V2 dependency
+├─ mcl_model_renamer_v3.py    # V3 extension
+└─ SHELF_LAUNCHER_V3.py
 ```
-
-No third-party dependency is required.
 
 ## Daily launch
 
-In **Maya Script Editor → Python**:
-
 ```python
-import mcl_model_renamer
-mcl_model_renamer.show()
+import mcl_model_renamer_v3
+mcl_model_renamer_v3.show()
 ```
 
-The same code can be used in a Shelf button.
+## V3 usage
 
-## Usage — Single mode
-
-1. Select exactly one local Mesh Transform.
-2. Set Base Name, Index, and Role.
-3. Confirm Single Preview.
-4. Click **Rename Selected**.
-5. On exact success, Index advances once.
-
-## Usage — Pair mode
-
-1. Select exactly two local Mesh Transforms.
-2. Set Base Name and Index. The Role field is ignored by pair mode.
-3. Confirm Pair Preview, for example `A_01_high / A_01_low`.
-4. Click **Rename Pair High / Low**.
-5. The higher-poly model becomes `_high`, the lower-poly model becomes `_low`.
-6. If both succeed, Index advances once.
-
-## Undo
-
-Single and pair actions each use one Maya Undo chunk as their target behavior.
-
-V2 does not synchronize the UI Index with Maya Undo. After undoing a rename, manually restore Index if needed.
+1. Select all candidate High/Low models.
+2. Set Base Name and starting Index.
+3. Click **Analyze Auto Pairs**.
+4. Read the preview list.
+5. If any line says `UNRESOLVED`, adjust the selection or use V2 manually.
+6. If analysis is ready, click **Apply Auto Pairs**.
+7. Index advances by the number of pairs after the whole batch succeeds.
 
 ## Out of scope
 
-- V3 multi-model spatial pairing.
-- Guessing High / Low when Face Counts are equal.
-- Manual pair editor.
-- Shape or Group auto-renaming.
-- Persistent settings.
-- History deletion.
-- Freeze Transform.
-- Material changes.
-- Hierarchy changes.
-- Maya global-setting changes.
-
-## Compatibility
-
-Host-independent checks do not prove compatibility with a specific Maya release. Actual Maya version support is recorded only after real host verification.
+Manual pair editor, forced ambiguous pairing, recursive Group/Shape naming, History deletion, Freeze Transform, material/hierarchy changes, Maya global-setting changes, and `trackSelectionOrder` changes.
