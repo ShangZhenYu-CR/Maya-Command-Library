@@ -20,6 +20,7 @@ AUTO_CENTER_LIMIT = 0.25
 AUTO_SIZE_LIMIT = 0.35
 AUTO_SIZE_WEIGHT = 0.35
 AUTO_AMBIGUITY_GAP = 0.05
+ALLOW_SELECTED_NAME_REUSE_DEFAULT = True
 _EPSILON = 1e-8
 
 
@@ -125,6 +126,89 @@ def _selected_mesh_transforms():
     return result
 
 
+def _long_name(node):
+    return (cmds.ls(node, long=True) or [node])[0]
+
+
+def _target_conflicts(node, target_leaf, selected_nodes, allow_selected_name_reuse=True):
+    """Return target occupiers that must block the V3 batch.
+
+    When allow_selected_name_reuse is enabled, an occupier is ignored only when
+    it is itself part of the current V3 selection. Those selected objects will
+    be moved to temporary names before final names are applied.
+    """
+    current_long = _long_name(node)
+    selected_long = {_long_name(item) for item in selected_nodes}
+    matches = cmds.ls(target_leaf, long=True) or []
+    conflicts = []
+
+    if base.leaf_name(current_long) == target_leaf and not allow_selected_name_reuse:
+        conflicts.append(current_long)
+
+    for match in matches:
+        match_long = _long_name(match)
+        if allow_selected_name_reuse and match_long in selected_long:
+            continue
+        conflicts.append(match_long)
+
+    return sorted(set(conflicts))
+
+
+def _unique_temp_leaf(node, prefix, ordinal, reserved_names):
+    namespace = base.namespace_prefix(node)
+    counter = max(int(ordinal), 1)
+    while True:
+        candidate = "{}__MCL_V3_{}_{:03d}__".format(namespace, prefix, counter)
+        if candidate not in reserved_names and not (cmds.ls(candidate, long=True) or []):
+            return candidate
+        counter += 1
+
+
+def _rename_batch_exact(node, target_leaf):
+    renamed = cmds.rename(node, target_leaf)
+    renamed_long = _long_name(renamed)
+    if base.leaf_name(renamed_long) != target_leaf:
+        raise base.RenameError(
+            "Maya did not apply the exact requested name '{}'; batch rollback will run.".format(
+                target_leaf
+            )
+        )
+    return renamed_long
+
+
+def _rollback_batch(records):
+    """Best-effort two-phase rollback to avoid original names blocking each other."""
+    errors = []
+    reserved = {record["original"] for record in records}
+
+    for index, record in enumerate(records, 1):
+        current = record.get("current", record["node"])
+        if not cmds.objExists(current):
+            errors.append("missing node during rollback: {}".format(current))
+            continue
+        if base.leaf_name(current) == record["original"]:
+            record["current"] = current
+            continue
+        try:
+            rollback_temp = _unique_temp_leaf(current, "ROLLBACK", index, reserved)
+            record["current"] = _rename_batch_exact(current, rollback_temp)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    for record in records:
+        current = record.get("current", record["node"])
+        if not cmds.objExists(current):
+            continue
+        if base.leaf_name(current) == record["original"]:
+            continue
+        try:
+            record["current"] = _rename_batch_exact(current, record["original"])
+        except Exception as exc:
+            errors.append(str(exc))
+
+    return errors
+
+
 def _world_bbox(node):
     try:
         bounds = cmds.exactWorldBoundingBox(node)
@@ -138,20 +222,27 @@ def _round_bounds(bounds):
     return tuple(round(float(value), 6) for value in bounds)
 
 
-def _analysis_signature(base_name, index_text, records, pairs):
+def _analysis_signature(base_name, index_text, records, pairs, allow_selected_name_reuse):
     record_state = tuple(sorted((r["node"], r["faces"], _round_bounds(r["bounds"])) for r in records))
     pair_state = tuple((
         pair["index_text"], pair["high"]["node"], pair["high"]["target"], pair["high"]["faces"],
         pair["low"]["node"], pair["low"]["target"], pair["low"]["faces"],
     ) for pair in pairs)
-    return (base.validate_base(base_name), base.format_index(base.parse_index(index_text)), record_state, pair_state)
+    return (
+        base.validate_base(base_name),
+        base.format_index(base.parse_index(index_text)),
+        bool(allow_selected_name_reuse),
+        record_state,
+        pair_state,
+    )
 
 
-def analyze_auto_pairs(base_name, index_text):
+def analyze_auto_pairs(base_name, index_text, allow_selected_name_reuse=ALLOW_SELECTED_NAME_REUSE_DEFAULT):
     """Read-only V3 analysis. No scene nodes are renamed here."""
     base.validate_base(base_name)
     start_index = base.parse_index(index_text)
     records = [{"node": node, "bounds": _world_bbox(node), "faces": base._face_count(node)} for node in _selected_mesh_transforms()]
+    selected_nodes = {record["node"] for record in records}
     pairing = auto_pair_records(records)
     unresolved = list(pairing["unresolved"])
     pairs = []
@@ -171,11 +262,22 @@ def analyze_auto_pairs(base_name, index_text):
                 "target": base.target_leaf_name(record["node"], names[role]),
                 "faces": record["faces"], "bounds": record["bounds"],
             }
-        try:
-            base._preflight_target(role_items["high"]["node"], role_items["high"]["target"])
-            base._preflight_target(role_items["low"]["node"], role_items["low"]["target"])
-        except base.RenameError:
-            unresolved.extend(((first["node"], "target_conflict"), (second["node"], "target_conflict")))
+        target_conflicts = []
+        for role in ("high", "low"):
+            item = role_items[role]
+            conflicts = _target_conflicts(
+                item["node"],
+                item["target"],
+                selected_nodes,
+                allow_selected_name_reuse=allow_selected_name_reuse,
+            )
+            if conflicts:
+                target_conflicts.append((item["target"], conflicts))
+
+        if target_conflicts:
+            conflict_names = ", ".join(target for target, _ in target_conflicts)
+            reason = "target_conflict:{}".format(conflict_names)
+            unresolved.extend(((first["node"], reason), (second["node"], reason)))
             continue
         pairs.append({
             "index_text": pair_index, "high": role_items["high"], "low": role_items["low"],
@@ -190,11 +292,25 @@ def analyze_auto_pairs(base_name, index_text):
             unresolved.append((record["node"], "unresolved"))
     unresolved = sorted(set(unresolved), key=lambda item: (item[0], item[1]))
     ready = bool(pairs) and not unresolved and len(paired_nodes) == len(records)
-    signature = _analysis_signature(base_name, index_text, records, pairs) if ready else None
+    signature = (
+        _analysis_signature(
+            base_name,
+            index_text,
+            records,
+            pairs,
+            allow_selected_name_reuse=allow_selected_name_reuse,
+        )
+        if ready
+        else None
+    )
     return {
-        "ready": ready, "pairs": pairs, "unresolved": unresolved, "signature": signature,
+        "ready": ready,
+        "pairs": pairs,
+        "unresolved": unresolved,
+        "signature": signature,
         "pair_count": len(pairs),
         "next_index": base.format_index(start_index + len(pairs)) if ready else base.format_index(start_index),
+        "allow_selected_name_reuse": bool(allow_selected_name_reuse),
     }
 
 
@@ -209,45 +325,97 @@ def analysis_lines(analysis):
     return lines or ["No pair candidates found."]
 
 
-def rename_auto_pairs(base_name, index_text, expected_signature):
+def rename_auto_pairs(
+    base_name,
+    index_text,
+    expected_signature,
+    allow_selected_name_reuse=ALLOW_SELECTED_NAME_REUSE_DEFAULT,
+):
     if expected_signature is None:
         raise base.RenameError("Analyze Auto Pairs before applying.")
-    analysis = analyze_auto_pairs(base_name, index_text)
+
+    analysis = analyze_auto_pairs(
+        base_name,
+        index_text,
+        allow_selected_name_reuse=allow_selected_name_reuse,
+    )
     if not analysis["ready"]:
         raise base.RenameError("Auto-pair analysis is no longer ready. Analyze again.")
     if analysis["signature"] != expected_signature:
-        raise base.RenameError("Selection, transforms, topology, or naming inputs changed. Analyze again.")
+        raise base.RenameError("Selection, transforms, topology, naming inputs, or conflict settings changed. Analyze again.")
 
     plan = []
     targets = []
+    selected_nodes = {
+        pair[role]["node"]
+        for pair in analysis["pairs"]
+        for role in ("high", "low")
+    }
+
     for pair in analysis["pairs"]:
         for role in ("high", "low"):
             item = pair[role]
-            base._preflight_target(item["node"], item["target"])
+            conflicts = _target_conflicts(
+                item["node"],
+                item["target"],
+                selected_nodes,
+                allow_selected_name_reuse=allow_selected_name_reuse,
+            )
+            if conflicts:
+                raise base.RenameError(
+                    "Target name '{}' is occupied by an unselected object: {}".format(
+                        item["target"], conflicts[0]
+                    )
+                )
             targets.append(item["target"])
-            plan.append({"node": item["node"], "target": item["target"], "original": item["original"]})
+            plan.append(
+                {
+                    "node": item["node"],
+                    "current": item["node"],
+                    "target": item["target"],
+                    "original": item["original"],
+                }
+            )
+
     if len(targets) != len(set(targets)):
         raise base.RenameError("Auto-pair plan contains duplicate target names.")
 
     chunk_open = False
-    renamed = []
     try:
         cmds.undoInfo(openChunk=True, chunkName=UNDO_CHUNK_AUTO)
         chunk_open = True
+
+        reserved_names = set(targets) | {item["original"] for item in plan}
+
+        # Phase 1: release every selected object's current leaf name. This makes
+        # selected-object name reuse safe even when final names form swaps/cycles.
+        for index, item in enumerate(plan, 1):
+            temp_leaf = _unique_temp_leaf(
+                item["current"],
+                "TMP",
+                index,
+                reserved_names,
+            )
+            item["current"] = _rename_batch_exact(item["current"], temp_leaf)
+
+        # Phase 2: all selected old names are free, so final targets can be
+        # written without Maya auto-suffixing or ordering dependencies.
         for item in plan:
-            new_node = base._rename_exact(item["node"], item["target"], item["original"])
-            renamed.append({"node": new_node, "original": item["original"]})
-        return {"pair_count": analysis["pair_count"], "renamed_count": len(plan), "next_index": analysis["next_index"]}
+            item["current"] = _rename_batch_exact(item["current"], item["target"])
+
+        return {
+            "pair_count": analysis["pair_count"],
+            "renamed_count": len(plan),
+            "next_index": analysis["next_index"],
+        }
+
     except Exception as exc:
-        rollback_errors = []
-        for item in reversed(renamed):
-            try:
-                if cmds.objExists(item["node"]):
-                    cmds.rename(item["node"], item["original"])
-            except Exception as rollback_exc:
-                rollback_errors.append(str(rollback_exc))
+        rollback_errors = _rollback_batch(plan)
         if rollback_errors:
-            raise base.RenameError("Auto-pair rename failed and rollback was incomplete. Use Undo immediately. Details: {}".format(" | ".join(rollback_errors)))
+            raise base.RenameError(
+                "Auto-pair rename failed and rollback was incomplete. Use Undo immediately. "
+                "Details: {}".format(" | ".join(rollback_errors))
+            )
         if isinstance(exc, base.RenameError):
             raise
         raise base.RenameError("Auto-pair rename failed: {}".format(exc))
@@ -276,6 +444,14 @@ def show():
     cmds.setParent(root)
     single_preview = cmds.textField(text="A_01_low", editable=False)
     pair_preview = cmds.textField(text="A_01_high / A_01_low", editable=False)
+    allow_selected_reuse = cmds.checkBox(
+        label="Allow Selected Name Reuse",
+        value=ALLOW_SELECTED_NAME_REUSE_DEFAULT,
+        annotation=(
+            "Allow selected objects to temporarily occupy V3 target names. "
+            "Unselected target-name conflicts still block Apply."
+        ),
+    )
     status = cmds.text(label="Ready", height=36, backgroundColor=(0.22, 0.22, 0.22), wordWrap=True)
     auto_list = cmds.textScrollList(numberOfRows=8, height=190)
     state = {"signature": None}
@@ -314,7 +490,11 @@ def show():
 
     def analyze(*_):
         try:
-            result = analyze_auto_pairs(cmds.textField(base_field, q=True, text=True), cmds.textField(index_field, q=True, text=True))
+            result = analyze_auto_pairs(
+                cmds.textField(base_field, q=True, text=True),
+                cmds.textField(index_field, q=True, text=True),
+                allow_selected_name_reuse=cmds.checkBox(allow_selected_reuse, q=True, value=True),
+            )
             cmds.textScrollList(auto_list, edit=True, removeAll=True)
             for line in analysis_lines(result): cmds.textScrollList(auto_list, edit=True, append=line)
             state["signature"] = result["signature"] if result["ready"] else None
@@ -324,12 +504,19 @@ def show():
 
     def apply(*_):
         try:
-            result = rename_auto_pairs(cmds.textField(base_field, q=True, text=True), cmds.textField(index_field, q=True, text=True), state["signature"])
+            result = rename_auto_pairs(
+                cmds.textField(base_field, q=True, text=True),
+                cmds.textField(index_field, q=True, text=True),
+                state["signature"],
+                allow_selected_name_reuse=cmds.checkBox(allow_selected_reuse, q=True, value=True),
+            )
             cmds.textField(index_field, edit=True, text=result["next_index"]); refresh(); _status(status, "Applied {} pairs / {} models. Next index: {}".format(result["pair_count"], result["renamed_count"], result["next_index"]), True)
         except base.RenameError as exc:
             _status(status, str(exc), False); cmds.warning("{}: {}".format(WINDOW_TITLE, exc))
 
-    for control in (base_field, index_field, role_field): cmds.textField(control, edit=True, changeCommand=refresh)
+    for control in (base_field, index_field, role_field):
+        cmds.textField(control, edit=True, changeCommand=refresh)
+    cmds.checkBox(allow_selected_reuse, edit=True, changeCommand=lambda *_: invalidate())
     cmds.rowLayout(numberOfColumns=3, adjustableColumn=1)
     cmds.button(label="Rename Selected", command=single); cmds.button(label="Rename Pair High / Low", command=pair); cmds.button(label="Reset to 01", command=lambda *_: (cmds.textField(index_field, edit=True, text="01"), refresh()))
     cmds.setParent(root)
