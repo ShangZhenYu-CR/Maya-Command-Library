@@ -331,7 +331,7 @@ def show():
 
     for control in (base_field, index_field, role_field): cmds.textField(control, edit=True, changeCommand=refresh)
     cmds.rowLayout(numberOfColumns=3, adjustableColumn=1)
-    cmds.button(label="Rename Selected", command=single); cmds.button(label="Rename Pair High / Low", command=pair); cmds.button(label="Reset to 01", command=lambda *_: cmds.textField(index_field, edit=True, text="01") or refresh())
+    cmds.button(label="Rename Selected", command=single); cmds.button(label="Rename Pair High / Low", command=pair); cmds.button(label="Reset to 01", command=lambda *_: (cmds.textField(index_field, edit=True, text="01"), refresh()))
     cmds.setParent(root)
     cmds.separator(style="in"); cmds.text(label="V3 Auto Pair: Analyze -> Preview -> Apply", font="boldLabelFont", align="left")
     cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
