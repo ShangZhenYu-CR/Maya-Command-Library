@@ -23,7 +23,10 @@ class Fake:
     def undoInfo(self,**k): self.undo.append(k)
     def rename(self,n,t):
         if t==self.fail: raise RuntimeError('fail')
-        new='|'+t; self.transforms.remove(n); self.transforms.add(new); self.shapes[new]=self.shapes.pop(n); self.boxes[new]=self.boxes.pop(n); self.selection=[new if x==n else x for x in self.selection]; self.calls.append((n,t)); return t
+        new='|'+t
+        if new in self.transforms and new != n:
+            raise RuntimeError('name conflict')
+        self.transforms.remove(n); self.transforms.add(new); self.shapes[new]=self.shapes.pop(n); self.boxes[new]=self.boxes.pop(n); self.selection=[new if x==n else x for x in self.selection]; self.calls.append((n,t)); return t
 
 def setup(fake): base.cmds=fake; v3.cmds=fake
 
@@ -72,3 +75,56 @@ def test_v3_source_does_not_change_global_or_destructive_maya_state():
     source = (Path(__file__).resolve().parents[1] / 'mcl_model_renamer_v3.py').read_text(encoding='utf-8')
     for token in ('deleteHistory', 'makeIdentity', 'polySoftEdge', 'optionVar(', 'trackSelectionOrder'):
         assert token not in source
+
+
+def test_selected_internal_target_names_are_allowed_by_default():
+    s = {
+        '|A_01_high': (500, bounds(0,0,0)),
+        '|A_01_low': (100, bounds(.02,0,0)),
+        '|H2': (600, bounds(10,0,0)),
+        '|L2': (120, bounds(10.02,0,0)),
+    }
+    f = Fake(list(s), s); setup(f)
+    a = v3.analyze_auto_pairs('A', '01')
+    assert a['ready']
+    r = v3.rename_auto_pairs('A', '01', a['signature'])
+    assert r['pair_count'] == 2 and r['next_index'] == '03'
+    assert {'|A_01_high','|A_01_low','|A_02_high','|A_02_low'} <= f.transforms
+    assert any('__MCL_V3_TMP_' in target for _, target in f.calls)
+
+
+def test_selected_internal_target_names_can_be_strictly_blocked():
+    s = {
+        '|A_01_high': (500, bounds(0,0,0)),
+        '|A_01_low': (100, bounds(.02,0,0)),
+    }
+    f = Fake(list(s), s); setup(f)
+    a = v3.analyze_auto_pairs('A', '01', allow_selected_name_reuse=False)
+    assert not a['ready']
+    assert any(reason.startswith('target_conflict:') for _, reason in a['unresolved'])
+
+
+def test_unselected_external_target_conflict_still_blocks():
+    s = {
+        '|H1': (500, bounds(0,0,0)),
+        '|L1': (100, bounds(.02,0,0)),
+        '|A_01_high': (50, bounds(100,0,0)),
+    }
+    f = Fake(['|H1','|L1'], s); setup(f)
+    a = v3.analyze_auto_pairs('A', '01')
+    assert not a['ready']
+    assert any('A_01_high' in reason for _, reason in a['unresolved'])
+
+
+def test_selected_reuse_setting_is_part_of_analysis_signature():
+    s = specs4(); f = Fake(list(s), s); setup(f)
+    a = v3.analyze_auto_pairs('A', '01', allow_selected_name_reuse=True)
+    with pytest.raises(base.RenameError, match='Analyze again'):
+        v3.rename_auto_pairs('A', '01', a['signature'], allow_selected_name_reuse=False)
+
+
+def test_v3_source_has_selected_name_reuse_default_on():
+    source = (Path(__file__).resolve().parents[1] / 'mcl_model_renamer_v3.py').read_text(encoding='utf-8')
+    assert 'ALLOW_SELECTED_NAME_REUSE_DEFAULT = True' in source
+    assert 'Allow Selected Name Reuse' in source
+    assert '_unique_temp_leaf' in source
