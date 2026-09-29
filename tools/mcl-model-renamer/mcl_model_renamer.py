@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
-"""MCL Model Renamer V1.
+"""MCL Model Renamer V2.
 
-A lightweight Maya tool for sequential model naming using the fixed pattern:
-    {Base}_{Index}_{Role}
-
-V1 intentionally handles exactly one local mesh transform at a time.
+V1: sequential single-model naming using {Base}_{Index}_{Role}.
+V2: two-model High/Low naming based on polygon face count.
 """
 
 from __future__ import annotations
@@ -19,7 +17,8 @@ except ImportError:  # Allows host-independent tests of pure helpers.
 
 WINDOW_NAME = "MCLModelRenamerWindow"
 WINDOW_TITLE = "MCL Model Renamer"
-UNDO_CHUNK_NAME = "MCL_Model_Renamer_V1"
+UNDO_CHUNK_SINGLE = "MCL_Model_Renamer_V1_Single"
+UNDO_CHUNK_PAIR = "MCL_Model_Renamer_V2_Pair"
 MIN_INDEX_WIDTH = 2
 
 _BASE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -71,6 +70,27 @@ def build_name(base: str, index_text: str, role: str) -> str:
     return "{}_{}_{}".format(safe_base, format_index(index), safe_role)
 
 
+def build_pair_names(base: str, index_text: str) -> dict:
+    return {
+        "high": build_name(base, index_text, "high"),
+        "low": build_name(base, index_text, "low"),
+    }
+
+
+def pair_roles_for_face_counts(first_faces: int, second_faces: int) -> tuple[str, str]:
+    if first_faces < 0 or second_faces < 0:
+        raise RenameError("Face Count cannot be negative.")
+    if first_faces == second_faces:
+        raise RenameError(
+            "Both selected models have the same Face Count ({}). High / Low cannot be determined.".format(
+                first_faces
+            )
+        )
+    if first_faces > second_faces:
+        return "high", "low"
+    return "low", "high"
+
+
 def next_index_text(index_text: str) -> str:
     return format_index(parse_index(index_text) + 1)
 
@@ -95,45 +115,77 @@ def _require_maya():
         raise RuntimeError("This operation must run inside Autodesk Maya.")
 
 
-def _selected_mesh_transform() -> str:
-    _require_maya()
-    raw = cmds.ls(selection=True, long=True, flatten=True) or []
-    if not raw:
-        raise RenameError("Select exactly one mesh transform.")
-    if len(raw) != 1:
-        raise RenameError("Select exactly one mesh transform.")
-
-    node = raw[0]
-    if "." in node:
-        raise RenameError("Component selection is not supported in V1. Select the transform.")
-    if not cmds.objExists(node):
-        raise RenameError("The selected object no longer exists.")
-    if cmds.nodeType(node) != "transform":
-        raise RenameError("Select a mesh transform, not a shape or another node type.")
-
+def _mesh_shapes(node: str) -> list[str]:
     shapes = cmds.listRelatives(node, shapes=True, fullPath=True, noIntermediate=True) or []
-    mesh_shapes = [shape for shape in shapes if cmds.nodeType(shape) == "mesh"]
-    if not mesh_shapes:
-        raise RenameError("The selected transform does not contain a non-intermediate mesh shape.")
+    return [shape for shape in shapes if cmds.nodeType(shape) == "mesh"]
+
+
+def _validate_mesh_transform(node: str) -> str:
+    if "." in node:
+        raise RenameError("Component selection is not supported. Select mesh transforms.")
+    if not cmds.objExists(node):
+        raise RenameError("A selected object no longer exists.")
+    if cmds.nodeType(node) != "transform":
+        raise RenameError("Select mesh transforms, not shapes or other node types.")
+
+    if not _mesh_shapes(node):
+        raise RenameError(
+            "The selected transform '{}' does not contain a non-intermediate mesh shape.".format(
+                leaf_name(node)
+            )
+        )
 
     try:
         if cmds.referenceQuery(node, isNodeReferenced=True):
-            raise RenameError("Referenced objects are not renamed in V1.")
+            raise RenameError("Referenced objects are not renamed.")
     except RenameError:
         raise
     except Exception:
-        raise RenameError("Could not determine whether the selected object is referenced.")
+        raise RenameError("Could not determine whether a selected object is referenced.")
 
     try:
         lock_state = cmds.lockNode(node, query=True, lock=True) or [False]
         if any(lock_state):
-            raise RenameError("The selected object is locked and cannot be renamed.")
+            raise RenameError("The selected object '{}' is locked.".format(leaf_name(node)))
     except RenameError:
         raise
     except Exception:
-        raise RenameError("Could not determine the selected object's lock state.")
+        raise RenameError("Could not determine a selected object's lock state.")
 
     return (cmds.ls(node, long=True) or [node])[0]
+
+
+def _selected_mesh_transforms(expected_count: int) -> list[str]:
+    _require_maya()
+    raw = cmds.ls(selection=True, long=True, flatten=True) or []
+    if len(raw) != expected_count:
+        noun = "mesh transform" if expected_count == 1 else "mesh transforms"
+        raise RenameError("Select exactly {} {}.".format(expected_count, noun))
+
+    result = [_validate_mesh_transform(node) for node in raw]
+    if len(set(result)) != expected_count:
+        raise RenameError("Select distinct mesh transforms.")
+    return result
+
+
+def _selected_mesh_transform() -> str:
+    return _selected_mesh_transforms(1)[0]
+
+
+def _selected_mesh_pair() -> tuple[str, str]:
+    pair = _selected_mesh_transforms(2)
+    return pair[0], pair[1]
+
+
+def _face_count(node: str) -> int:
+    total = 0
+    for shape in _mesh_shapes(node):
+        value = cmds.polyEvaluate(shape, face=True)
+        try:
+            total += int(value)
+        except (TypeError, ValueError):
+            raise RenameError("Could not read Face Count for '{}'.".format(leaf_name(node)))
+    return total
 
 
 def _preflight_target(node: str, target_leaf: str):
@@ -149,12 +201,27 @@ def _preflight_target(node: str, target_leaf: str):
             raise RenameError("Target name already exists: {}".format(target_leaf))
 
 
-def rename_selected(base: str, index_text: str, role: str) -> dict:
-    """Validate and rename exactly one selected local mesh transform.
+def _rename_exact(node: str, target_leaf: str, original_leaf: str) -> str:
+    renamed = cmds.rename(node, target_leaf)
+    renamed_long = (cmds.ls(renamed, long=True) or [renamed])[0]
+    actual_leaf = leaf_name(renamed_long)
+    if actual_leaf == target_leaf:
+        return renamed_long
 
-    Returns a result dictionary used by the UI. The index is advanced only after
-    Maya confirms the exact requested leaf name.
-    """
+    try:
+        cmds.rename(renamed_long, original_leaf)
+    except Exception:
+        raise RenameError(
+            "Maya did not apply the exact requested name and the original name could not "
+            "be restored automatically. Use Undo immediately."
+        )
+    raise RenameError(
+        "Maya did not apply the exact requested name. No automatic suffix was accepted."
+    )
+
+
+def rename_selected(base: str, index_text: str, role: str) -> dict:
+    """V1 behavior: rename exactly one selected local mesh transform."""
     _require_maya()
 
     generated = build_name(base, index_text, role)
@@ -166,28 +233,12 @@ def rename_selected(base: str, index_text: str, role: str) -> dict:
     chunk_open = False
 
     try:
-        cmds.undoInfo(openChunk=True, chunkName=UNDO_CHUNK_NAME)
+        cmds.undoInfo(openChunk=True, chunkName=UNDO_CHUNK_SINGLE)
         chunk_open = True
-
-        renamed = cmds.rename(node, target_leaf)
-        renamed_long = (cmds.ls(renamed, long=True) or [renamed])[0]
-        actual_leaf = leaf_name(renamed_long)
-
-        if actual_leaf != target_leaf:
-            try:
-                cmds.rename(renamed_long, original_leaf)
-            except Exception:
-                raise RenameError(
-                    "Maya did not apply the exact requested name and the original name "
-                    "could not be restored automatically. Use Undo immediately."
-                )
-            raise RenameError(
-                "Maya did not apply the exact requested name. No automatic suffix was accepted."
-            )
-
+        renamed_long = _rename_exact(node, target_leaf, original_leaf)
         return {
             "old_name": original_leaf,
-            "new_name": actual_leaf,
+            "new_name": leaf_name(renamed_long),
             "next_index": next_index_text(index_text),
             "node": renamed_long,
         }
@@ -203,14 +254,105 @@ def rename_selected(base: str, index_text: str, role: str) -> dict:
                 pass
 
 
+def rename_pair_high_low(base: str, index_text: str) -> dict:
+    """V2 behavior: classify exactly two meshes by Face Count and rename as a pair."""
+    _require_maya()
+
+    pair_names = build_pair_names(base, index_text)
+    first, second = _selected_mesh_pair()
+    first_faces = _face_count(first)
+    second_faces = _face_count(second)
+    first_role, second_role = pair_roles_for_face_counts(first_faces, second_faces)
+
+    plan = [
+        {
+            "node": first,
+            "faces": first_faces,
+            "role": first_role,
+            "target": target_leaf_name(first, pair_names[first_role]),
+            "original": leaf_name(first),
+        },
+        {
+            "node": second,
+            "faces": second_faces,
+            "role": second_role,
+            "target": target_leaf_name(second, pair_names[second_role]),
+            "original": leaf_name(second),
+        },
+    ]
+
+    if plan[0]["target"] == plan[1]["target"]:
+        raise RenameError("The two pair targets resolve to the same name.")
+
+    for item in plan:
+        _preflight_target(item["node"], item["target"])
+
+    chunk_open = False
+    renamed_records = []
+
+    try:
+        cmds.undoInfo(openChunk=True, chunkName=UNDO_CHUNK_PAIR)
+        chunk_open = True
+
+        for item in plan:
+            renamed_long = _rename_exact(item["node"], item["target"], item["original"])
+            renamed_records.append(
+                {
+                    "node": renamed_long,
+                    "original": item["original"],
+                }
+            )
+            item["node"] = renamed_long
+
+        result = {"next_index": next_index_text(index_text)}
+        for item in plan:
+            result[item["role"]] = {
+                "old_name": item["original"],
+                "new_name": leaf_name(item["node"]),
+                "faces": item["faces"],
+                "node": item["node"],
+            }
+        return result
+
+    except Exception as exc:
+        rollback_errors = []
+        for record in reversed(renamed_records):
+            try:
+                if cmds.objExists(record["node"]):
+                    cmds.rename(record["node"], record["original"])
+            except Exception as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+
+        if rollback_errors:
+            raise RenameError(
+                "Pair rename failed and automatic rollback was incomplete. Use Undo immediately. "
+                "Details: {}".format(" | ".join(rollback_errors))
+            )
+        if isinstance(exc, RenameError):
+            raise
+        raise RenameError("Pair rename failed: {}".format(exc))
+
+    finally:
+        if chunk_open:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception:
+                pass
+
+
 def _set_status(status_control, message: str, good: bool):
     color = (0.30, 0.72, 0.42) if good else (0.90, 0.34, 0.36)
-    cmds.text(status_control, edit=True, label=message, font="smallPlainLabelFont")
-    cmds.text(status_control, edit=True, backgroundColor=color)
+    cmds.text(
+        status_control,
+        edit=True,
+        label=message,
+        font="smallPlainLabelFont",
+        backgroundColor=color,
+    )
 
 
 def show():
-    """Open the MCL Model Renamer V1 Maya window."""
+    """Open the MCL Model Renamer V2 Maya window."""
     _require_maya()
 
     if cmds.window(WINDOW_NAME, exists=True):
@@ -220,53 +362,62 @@ def show():
         WINDOW_NAME,
         title=WINDOW_TITLE,
         sizeable=False,
-        widthHeight=(340, 260),
+        widthHeight=(360, 345),
     )
 
     root = cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnAlign="left")
     cmds.separator(height=8, style="none")
-    cmds.text(label="Sequential model naming", align="left", font="boldLabelFont")
+    cmds.text(label="Sequential + High / Low naming", align="left", font="boldLabelFont")
     cmds.text(
-        label="Pattern: {Base}_{Index}_{Role}",
+        label="Single: {Base}_{Index}_{Role}  |  Pair: _high / _low",
         align="left",
         font="smallPlainLabelFont",
     )
 
     cmds.rowColumnLayout(
         numberOfColumns=2,
-        columnWidth=[(1, 92), (2, 225)],
+        columnWidth=[(1, 100), (2, 235)],
         columnSpacing=[(1, 8), (2, 0)],
     )
     cmds.text(label="Base Name", align="left")
     base_field = cmds.textField(text="A")
     cmds.text(label="Index", align="left")
     index_field = cmds.textField(text="01")
-    cmds.text(label="Role", align="left")
+    cmds.text(label="Role (single)", align="left")
     role_field = cmds.textField(text="low")
     cmds.setParent(root)
 
     cmds.separator(height=4, style="none")
-    cmds.text(label="Preview", align="left", font="smallPlainLabelFont")
+    cmds.text(label="Single Preview", align="left", font="smallPlainLabelFont")
     preview_field = cmds.textField(text="A_01_low", editable=False)
+    cmds.text(label="Pair Preview", align="left", font="smallPlainLabelFont")
+    pair_preview_field = cmds.textField(text="A_01_high  /  A_01_low", editable=False)
 
     status = cmds.text(
         label="Ready",
         align="left",
-        height=28,
+        height=34,
         backgroundColor=(0.22, 0.22, 0.22),
+        wordWrap=True,
     )
 
     def update_preview(*_):
+        base = cmds.textField(base_field, query=True, text=True)
+        index_text = cmds.textField(index_field, query=True, text=True)
+        role = cmds.textField(role_field, query=True, text=True)
         try:
-            preview = build_name(
-                cmds.textField(base_field, query=True, text=True),
-                cmds.textField(index_field, query=True, text=True),
-                cmds.textField(role_field, query=True, text=True),
+            single_preview = build_name(base, index_text, role)
+            pair_preview = build_pair_names(base, index_text)
+            cmds.textField(preview_field, edit=True, text=single_preview)
+            cmds.textField(
+                pair_preview_field,
+                edit=True,
+                text="{}  /  {}".format(pair_preview["high"], pair_preview["low"]),
             )
-            cmds.textField(preview_field, edit=True, text=preview)
             _set_status(status, "Ready", True)
         except RenameError as exc:
             cmds.textField(preview_field, edit=True, text="—")
+            cmds.textField(pair_preview_field, edit=True, text="—")
             _set_status(status, str(exc), False)
 
     def do_rename(*_):
@@ -284,10 +435,30 @@ def show():
         update_preview()
         _set_status(
             status,
-            "Renamed: {} -> {} | Next: {}".format(
-                result["old_name"],
-                result["new_name"],
-                build_name(base, result["next_index"], role),
+            "Renamed: {} -> {} | Next index: {}".format(
+                result["old_name"], result["new_name"], result["next_index"]
+            ),
+            True,
+        )
+
+    def do_pair_rename(*_):
+        base = cmds.textField(base_field, query=True, text=True)
+        index_text = cmds.textField(index_field, query=True, text=True)
+        try:
+            result = rename_pair_high_low(base, index_text)
+        except RenameError as exc:
+            _set_status(status, str(exc), False)
+            cmds.warning("{}: {}".format(WINDOW_TITLE, exc))
+            return
+
+        cmds.textField(index_field, edit=True, text=result["next_index"])
+        update_preview()
+        _set_status(
+            status,
+            "Pair renamed | high: {} faces | low: {} faces | Next index: {}".format(
+                result["high"]["faces"],
+                result["low"]["faces"],
+                result["next_index"],
             ),
             True,
         )
@@ -300,10 +471,14 @@ def show():
     for control in (base_field, index_field, role_field):
         cmds.textField(control, edit=True, changeCommand=update_preview)
 
-    cmds.button(label="Rename Selected", height=36, command=do_rename)
+    cmds.button(label="Rename Selected", height=34, command=do_rename)
+    cmds.button(label="Rename Pair High / Low", height=38, command=do_pair_rename)
     cmds.button(label="Reset to 01", height=28, command=reset_index)
     cmds.text(
-        label="V1: one local mesh transform at a time. Ctrl+Z restores the Maya rename.",
+        label=(
+            "V2 pair mode: select exactly 2 local mesh transforms. Higher Face Count = high; "
+            "lower Face Count = low. Equal counts stop without renaming."
+        ),
         align="left",
         font="smallPlainLabelFont",
         wordWrap=True,
