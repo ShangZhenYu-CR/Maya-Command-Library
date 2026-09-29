@@ -40,6 +40,7 @@ class FakeMaya:
         self.offset_parent = {node: tool._identity_matrix() for node in self.targets | self.proxies}
         self.match_calls = []
         self.set_calls = []
+        self.rename_calls = []
         self.undo_calls = []
         self.fail_target = fail_target
 
@@ -106,7 +107,8 @@ class FakeMaya:
         if shapes:
             return list(self.shapes.get(node, []))
         if parent:
-            return []
+            parent_path = node.rsplit("|", 1)[0]
+            return [parent_path] if parent_path else []
         return []
 
     def nodeType(self, node):
@@ -120,7 +122,7 @@ class FakeMaya:
         if value.endswith(".offsetParentMatrix"):
             node = value.rsplit(".", 1)[0]
             return node in self.transforms and node != self.proxy_root
-        return value in self.transforms or value.endswith("|Shape")
+        return value in self.transforms or value in {shape for shapes in self.shapes.values() for shape in shapes}
 
     def getAttr(self, attr, settable=False, **kwargs):
         if attr.endswith(".intermediateObject"):
@@ -130,11 +132,9 @@ class FakeMaya:
             return True
         if plug in ("translate", "rotate", "scale"):
             return [self.values[node][plug]]
-        if plug in (
-            "translateX", "translateY", "translateZ",
-            "rotateX", "rotateY", "rotateZ",
-            "scaleX", "scaleY", "scaleZ",
-        ):
+        if plug in ("translateX", "translateY", "translateZ",
+                    "rotateX", "rotateY", "rotateZ",
+                    "scaleX", "scaleY", "scaleZ"):
             base = {"t": "translate", "r": "rotate", "s": "scale"}[plug[0]]
             axis = {"X": 0, "Y": 1, "Z": 2}[plug[-1]]
             return self.values[node][base][axis]
@@ -162,6 +162,36 @@ class FakeMaya:
             self.offset_parent[node] = tool._matrix16(matrix)
             return
         raise RuntimeError("unsupported setAttr {}".format(attr))
+
+    def rename(self, node, desired):
+        self.rename_calls.append((node, desired))
+        parent = node.rsplit("|", 1)[0]
+        new_node = (parent + "|" + desired) if parent else ("|" + desired)
+        if new_node in self.transforms and new_node != node:
+            raise RuntimeError("name conflict")
+
+        def moved(value):
+            if value == node:
+                return new_node
+            if value.startswith(node + "|"):
+                return new_node + value[len(node):]
+            return value
+
+        self.transforms = {moved(value) for value in self.transforms}
+        self.targets = {moved(value) for value in self.targets}
+        self.proxies = {moved(value) for value in self.proxies}
+        self.selection = [moved(value) for value in self.selection]
+
+        new_shapes = {}
+        for owner, shapes in self.shapes.items():
+            new_owner = moved(owner)
+            new_shapes[new_owner] = [moved(shape) for shape in shapes]
+        self.shapes = new_shapes
+
+        self.boxes = {moved(owner): value for owner, value in self.boxes.items()}
+        self.values = {moved(owner): value for owner, value in self.values.items()}
+        self.offset_parent = {moved(owner): value for owner, value in self.offset_parent.items()}
+        return new_node
 
     def referenceQuery(self, node, **kwargs):
         return False
@@ -363,6 +393,73 @@ def test_missing_proxy_group_stops_before_changes():
     assert fake.match_calls == []
 
 
+def test_name_sync_off_does_not_rename_anything():
+    fake = make_fake()
+    setup(fake)
+    analysis = tool.analyze_matches(sync_names=False)
+    result = tool.apply_matches(analysis["signature"], sync_names=False)
+    assert result["renamed_count"] == 0
+    assert fake.rename_calls == []
+    assert "|FinalA" in fake.targets
+    assert "|proxy|ProxyA" in fake.proxies
+
+
+def test_name_sync_on_copies_proxy_base_name_and_prefixes_proxy():
+    fake = make_fake()
+    setup(fake)
+    analysis = tool.analyze_matches(sync_names=True, proxy_prefix="synced_")
+    lines = tool.analysis_lines(analysis)
+    assert "NAME | FinalA -> ProxyA | ProxyA -> synced_ProxyA" in lines
+    result = tool.apply_matches(
+        analysis["signature"], sync_names=True, proxy_prefix="synced_"
+    )
+    assert result["renamed_count"] == 4
+    assert "|ProxyA" in fake.targets
+    assert "|ProxyB" in fake.targets
+    assert "|proxy|synced_ProxyA" in fake.proxies
+    assert "|proxy|synced_ProxyB" in fake.proxies
+    assert "|proxy|Unused" in fake.proxies
+
+
+def test_name_sync_is_idempotent_for_already_prefixed_proxy():
+    fake = make_fake()
+    setup(fake)
+    fake.rename("|proxy|ProxyA", "synced_ProxyA")
+    analysis = tool.analyze_matches(sync_names=True, proxy_prefix="synced_")
+    entry = next(item for item in analysis["name_plan"] if item["proxy"].endswith("synced_ProxyA"))
+    assert entry["target_name"] == "ProxyA"
+    assert entry["proxy_name"] == "synced_ProxyA"
+
+
+def test_name_sync_conflict_blocks_before_scene_changes():
+    fake = make_fake()
+    fake.transforms.add("|ProxyA")
+    setup(fake)
+    with pytest.raises(tool.PivotMatchError, match="Name conflict"):
+        tool.analyze_matches(sync_names=True, proxy_prefix="synced_")
+    assert fake.match_calls == []
+    assert fake.set_calls == []
+    assert fake.undo_calls == []
+
+
+def test_name_sync_namespace_is_rejected():
+    fake = make_fake()
+    setup(fake)
+    fake.rename("|proxy|ProxyA", "ns:ProxyA")
+    with pytest.raises(tool.PivotMatchError, match="does not support namespaces"):
+        tool.analyze_matches(sync_names=True, proxy_prefix="synced_")
+
+
+def test_name_sync_prefix_change_requires_reanalysis():
+    fake = make_fake()
+    setup(fake)
+    analysis = tool.analyze_matches(sync_names=True, proxy_prefix="synced_")
+    with pytest.raises(tool.PivotMatchError, match="Analyze again"):
+        tool.apply_matches(
+            analysis["signature"], sync_names=True, proxy_prefix="done_"
+        )
+
+
 def test_partial_failure_closes_chunk_and_reports_undo():
     fake = make_fake(fail_target="|FinalB")
     setup(fake)
@@ -380,7 +477,9 @@ def test_static_safety_contract():
     assert "matchTransform(target, proxy, pivots=True)" in source
     assert "offsetParentMatrix" in source
     assert "_rebalance_transform_values_with_offset_parent_matrix" in source
-    assert \'cmds.setAttr(target + ".offsetParentMatrix"\' in source
+    assert 'cmds.setAttr(target + ".offsetParentMatrix"' in source
+    assert "cmds.rename(" in source
+    assert "DEFAULT_SYNCED_PREFIX" in source
     assert "preserveGeometryPosition=True" not in source
     for token in (
         "deleteHistory",
@@ -388,6 +487,5 @@ def test_static_safety_contract():
         "polySoftEdge",
         "optionVar(",
         "trackSelectionOrder",
-        "cmds.rename(",
     ):
         assert token not in source
