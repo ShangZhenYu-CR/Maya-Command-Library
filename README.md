@@ -13,7 +13,7 @@ Lightweight Maya commands and tools managed through Jira project **MCL**.
 | Tool | Jira | Purpose | Current attempt |
 | --- | --- | --- | --- |
 | [MCL Model Renamer](./tools/mcl-model-renamer/) | MCL-1 | Sequential, two-model High/Low, and multi-model spatial auto-pair naming | 0.3.1 / V3 |
-| [MCL Proxy Pivot Matcher](./tools/mcl-proxy-pivot-matcher/) | MCL-2 | Batch-match selected final-model pivots from spatially corresponding proxies under `|proxy` | V1 |
+| [MCL Proxy Pivot Matcher](./tools/mcl-proxy-pivot-matcher/) | MCL-2 | Batch-match selected final-model pivots and T/R/S values from spatially corresponding proxies under `|proxy` | V1.1 |
 
 ## Delivery rule
 
