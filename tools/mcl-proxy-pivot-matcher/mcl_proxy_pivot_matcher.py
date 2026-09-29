@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """MCL Proxy Pivot Matcher.
 
-MCL-2 V1.1.
+MCL-2 V1.2.
 
 Workflow:
 1. Put proxy meshes under the root group ``|proxy``.
 2. Select one or more final mesh transforms.
 3. Analyze conservative world-space Target -> Proxy matches.
-4. Apply Proxy T/R/S channel values while preserving geometry, then Match Pivots, in one undo chunk.
+4. Match Pivots, write Proxy T/R/S channel values exactly, and rebalance offsetParentMatrix to preserve the Target world matrix.
 
 Spatial thresholds intentionally mirror the fixed MCL-1 V3 pairing approach
 (commit 5c650ddea9b80c65769ff914e8cf1127c706208c), but this tool is standalone
@@ -334,46 +334,137 @@ def _values_close(first, second, tolerance=1e-6):
     return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(first, second))
 
 
-def _sync_transform_values_preserve_geometry(target, proxy):
-    """Match Proxy T/R/S channel values while compensating geometry in world space.
+def _identity_matrix():
+    return (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
 
-    Maya's move/rotate/scale preserveGeometryPosition option applies the inverse
-    transform to geometry points. preserveChildPosition keeps child transforms in
-    their previous world-space positions.
-    """
+
+def _matrix16(value, label="matrix"):
+    if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], (list, tuple)):
+        value = value[0]
+    if not isinstance(value, (list, tuple)) or len(value) != 16:
+        raise PivotMatchError("Unexpected {} value: {}".format(label, value))
+    return tuple(float(component) for component in value)
+
+
+def _matrix_multiply(first, second):
+    a = _matrix16(first, "first matrix")
+    b = _matrix16(second, "second matrix")
+    result = [0.0] * 16
+    for row in range(4):
+        for col in range(4):
+            result[row * 4 + col] = sum(
+                a[row * 4 + k] * b[k * 4 + col]
+                for k in range(4)
+            )
+    return tuple(result)
+
+
+def _matrix_inverse(matrix, tolerance=1e-12):
+    source = _matrix16(matrix)
+    aug = []
+    for row in range(4):
+        aug.append(
+            list(source[row * 4:(row + 1) * 4])
+            + [1.0 if row == col else 0.0 for col in range(4)]
+        )
+
+    for col in range(4):
+        pivot_row = max(range(col, 4), key=lambda row: abs(aug[row][col]))
+        pivot = aug[pivot_row][col]
+        if abs(pivot) <= tolerance:
+            raise PivotMatchError(
+                "Cannot rebalance transform because the resulting local matrix is singular. "
+                "Check for zero scale values."
+            )
+        if pivot_row != col:
+            aug[col], aug[pivot_row] = aug[pivot_row], aug[col]
+
+        pivot = aug[col][col]
+        aug[col] = [value / pivot for value in aug[col]]
+        for row in range(4):
+            if row == col:
+                continue
+            factor = aug[row][col]
+            if abs(factor) <= tolerance:
+                continue
+            aug[row] = [
+                aug[row][index] - factor * aug[col][index]
+                for index in range(8)
+            ]
+
+    return tuple(aug[row][col] for row in range(4) for col in range(4, 8))
+
+
+def _matrices_close(first, second, tolerance=1e-6):
+    return all(
+        abs(float(a) - float(b)) <= tolerance
+        for a, b in zip(_matrix16(first), _matrix16(second))
+    )
+
+
+def _matrix_attr(node, attr):
+    try:
+        return _matrix16(cmds.getAttr(node + "." + attr), "{}.{}".format(leaf_name(node), attr))
+    except PivotMatchError:
+        raise
+    except Exception as exc:
+        raise PivotMatchError(
+            "Could not read {} from '{}': {}".format(attr, leaf_name(node), exc)
+        )
+
+
+def _dag_parent_world_matrix(node):
+    parents = cmds.listRelatives(node, parent=True, fullPath=True, type="transform") or []
+    if not parents:
+        return _identity_matrix()
+    if len(parents) != 1:
+        raise PivotMatchError("Unexpected multiple DAG parents for '{}'.".format(leaf_name(node)))
+    return _matrix_attr(parents[0], "worldMatrix[0]")
+
+
+def _validate_offset_parent_matrix_writable(node):
+    attr = node + ".offsetParentMatrix"
+    if not cmds.objExists(attr):
+        raise PivotMatchError(
+            "Target '{}' has no offsetParentMatrix. This V1.2 method requires a Maya version that supports it.".format(
+                leaf_name(node)
+            )
+        )
+    try:
+        if not cmds.getAttr(attr, settable=True):
+            raise PivotMatchError(
+                "Target '{}' offsetParentMatrix is locked or connected; coordinate values cannot be synchronized safely.".format(
+                    leaf_name(node)
+                )
+            )
+    except PivotMatchError:
+        raise
+    except Exception as exc:
+        raise PivotMatchError(
+            "Could not inspect offsetParentMatrix on '{}': {}".format(leaf_name(node), exc)
+        )
+
+
+def _set_vector_attr(node, attr, values):
+    values = tuple(float(value) for value in values)
+    try:
+        cmds.setAttr(node + "." + attr, values[0], values[1], values[2], type="double3")
+    except Exception as exc:
+        raise PivotMatchError(
+            "Could not set {} on '{}': {}".format(attr, leaf_name(node), exc)
+        )
+
+
+def _set_transform_values_exact(target, desired):
     _validate_transform_channels_writable(target)
-    desired = _transform_values(proxy)
-
-    cmds.move(
-        desired["translate"][0],
-        desired["translate"][1],
-        desired["translate"][2],
-        target,
-        absolute=True,
-        localSpace=True,
-        preserveGeometryPosition=True,
-        preserveChildPosition=True,
-    )
-    cmds.rotate(
-        desired["rotate"][0],
-        desired["rotate"][1],
-        desired["rotate"][2],
-        target,
-        absolute=True,
-        objectSpace=True,
-        preserveGeometryPosition=True,
-        preserveChildPosition=True,
-    )
-    cmds.scale(
-        desired["scale"][0],
-        desired["scale"][1],
-        desired["scale"][2],
-        target,
-        absolute=True,
-        localSpace=True,
-        preserveGeometryPosition=True,
-        preserveChildPosition=True,
-    )
+    _set_vector_attr(target, "translate", desired["translate"])
+    _set_vector_attr(target, "rotate", desired["rotate"])
+    _set_vector_attr(target, "scale", desired["scale"])
 
     actual = _transform_values(target)
     for attr in ("translate", "rotate", "scale"):
@@ -383,6 +474,70 @@ def _sync_transform_values_preserve_geometry(target, proxy):
                     attr, leaf_name(target)
                 )
             )
+
+
+def _rebalance_transform_values_with_offset_parent_matrix(target, proxy):
+    """Set Proxy T/R/S exactly while preserving the Target world matrix.
+
+    Maya post-multiplies matrices. With a DAG parent P, local matrix L and
+    offsetParentMatrix O, the Target world matrix is L * O * P. After pivots and
+    desired T/R/S are written, solve O = inverse(L) * W_before * inverse(P).
+    """
+    _validate_transform_channels_writable(target)
+    _validate_offset_parent_matrix_writable(target)
+
+    world_before = _matrix_attr(target, "worldMatrix[0]")
+    desired = _transform_values(proxy)
+
+    cmds.matchTransform(target, proxy, pivots=True)
+
+    try:
+        rotate_order = int(cmds.getAttr(proxy + ".rotateOrder"))
+        if not cmds.getAttr(target + ".rotateOrder", settable=True):
+            raise PivotMatchError(
+                "Target '{}' rotateOrder is locked or connected.".format(leaf_name(target))
+            )
+        cmds.setAttr(target + ".rotateOrder", rotate_order)
+    except PivotMatchError:
+        raise
+    except Exception as exc:
+        raise PivotMatchError(
+            "Could not synchronize rotateOrder for '{}': {}".format(leaf_name(target), exc)
+        )
+
+    _set_transform_values_exact(target, desired)
+
+    local_after = _matrix_attr(target, "matrix")
+    parent_world = _dag_parent_world_matrix(target)
+    compensation = _matrix_multiply(
+        _matrix_multiply(_matrix_inverse(local_after), world_before),
+        _matrix_inverse(parent_world),
+    )
+
+    try:
+        cmds.setAttr(target + ".offsetParentMatrix", compensation, type="matrix")
+    except Exception as exc:
+        raise PivotMatchError(
+            "Could not write offsetParentMatrix for '{}': {}".format(leaf_name(target), exc)
+        )
+
+    actual = _transform_values(target)
+    for attr in ("translate", "rotate", "scale"):
+        if not _values_close(actual[attr], desired[attr]):
+            raise PivotMatchError(
+                "{} values on '{}' did not remain equal to Proxy values after rebalance.".format(
+                    attr, leaf_name(target)
+                )
+            )
+
+    world_after = _matrix_attr(target, "worldMatrix[0]")
+    if not _matrices_close(world_after, world_before):
+        raise PivotMatchError(
+            "World transform changed while synchronizing '{}'. Use Undo immediately.".format(
+                leaf_name(target)
+            )
+        )
+
     return desired
 
 
@@ -472,7 +627,7 @@ def analysis_lines(analysis):
 
 
 def apply_matches(expected_signature):
-    """Apply Proxy coordinate values + Match Pivots for a previously analyzed selection."""
+    """Apply exact Proxy coordinate values + Match Pivots for a previously analyzed selection."""
     if expected_signature is None:
         raise PivotMatchError("Analyze the selection before applying.")
 
@@ -493,12 +648,9 @@ def apply_matches(expected_signature):
             target = pair["target"]["node"]
             proxy = pair["proxy"]["node"]
 
-            # V1.1: synchronize visible Channel Box T/R/S values from Proxy while
-            # preserving final geometry (and child transforms) in world space.
-            _sync_transform_values_preserve_geometry(target, proxy)
-
-            # Then match rotate/scale pivot positions/orientation.
-            cmds.matchTransform(target, proxy, pivots=True)
+            # V1.2: directly write Proxy Channel Box T/R/S values and solve an
+            # offsetParentMatrix compensation so the Target world matrix stays exact.
+            _rebalance_transform_values_with_offset_parent_matrix(target, proxy)
             applied += 1
         return {"matched_count": applied, "pairs": analysis["pairs"]}
     except Exception as exc:
@@ -590,7 +742,7 @@ def show():
             invalidate()
             _set_status(
                 status,
-                "Matched pivots + T/R/S values for {} final model(s).".format(result["matched_count"]),
+                "Matched pivots + exact T/R/S values for {} final model(s).".format(result["matched_count"]),
                 True,
             )
         except PivotMatchError as exc:
@@ -599,7 +751,7 @@ def show():
 
     cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
     cmds.button(label="Analyze", height=38, command=analyze)
-    cmds.button(label="Apply Pivots + Coordinates", height=38, command=apply)
+    cmds.button(label="Apply Pivots + Coordinates V1.2", height=38, command=apply)
     cmds.setParent(root)
     cmds.text(
         label="If Apply reports a partial failure, use one Undo immediately.",
