@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """MCL Proxy Pivot Matcher.
 
-MCL-2 V1.2.
+MCL-2 V1.3.
 
 Workflow:
 1. Put proxy meshes under the root group ``|proxy``.
 2. Select one or more final mesh transforms.
 3. Analyze conservative world-space Target -> Proxy matches.
-4. Match Pivots, write Proxy T/R/S channel values exactly, and rebalance offsetParentMatrix to preserve the Target world matrix.
+4. Optionally synchronize names, then match Pivots, write Proxy T/R/S channel values exactly, and rebalance offsetParentMatrix to preserve the Target world matrix.
 
 Spatial thresholds intentionally mirror the fixed MCL-1 V3 pairing approach
 (commit 5c650ddea9b80c65769ff914e8cf1127c706208c), but this tool is standalone
@@ -16,6 +16,7 @@ and does not modify or depend on the MCL Model Renamer at runtime.
 from __future__ import annotations
 
 import math
+import re
 
 try:
     import maya.cmds as cmds
@@ -26,6 +27,7 @@ WINDOW_NAME = "MCLProxyPivotMatcherWindow"
 WINDOW_TITLE = "MCL Proxy Pivot Matcher"
 PROXY_ROOT = "|proxy"
 UNDO_CHUNK = "MCL_Proxy_Pivot_Matcher"
+DEFAULT_SYNCED_PREFIX = "synced_"
 
 CENTER_LIMIT = 0.25
 SIZE_LIMIT = 0.35
@@ -45,6 +47,143 @@ def _require_cmds():
 
 def leaf_name(node):
     return str(node).rsplit("|", 1)[-1]
+
+
+def _validate_sync_prefix(prefix):
+    prefix = str(prefix or "").strip()
+    if not prefix:
+        raise PivotMatchError("Proxy synced prefix cannot be empty.")
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", prefix):
+        raise PivotMatchError(
+            "Proxy synced prefix must use only letters, numbers, and underscores, and cannot start with a number."
+        )
+    return prefix
+
+
+def _dag_parent(node):
+    parents = cmds.listRelatives(node, parent=True, fullPath=True, type="transform") or []
+    if not parents:
+        return None
+    if len(parents) != 1:
+        raise PivotMatchError("Unexpected multiple DAG parents for '{}'.".format(leaf_name(node)))
+    return parents[0]
+
+
+def _desired_dag_path(node, desired_leaf):
+    parent = _dag_parent(node)
+    return (parent + "|" + desired_leaf) if parent else ("|" + desired_leaf)
+
+
+def _validate_renameable(node, role):
+    try:
+        if cmds.referenceQuery(node, isNodeReferenced=True):
+            raise PivotMatchError(
+                "{} '{}' is referenced and cannot be renamed safely.".format(role, leaf_name(node))
+            )
+    except PivotMatchError:
+        raise
+    except Exception:
+        pass
+    try:
+        locked = cmds.lockNode(node, query=True, lock=True) or [False]
+        if any(bool(value) for value in locked):
+            raise PivotMatchError(
+                "{} '{}' is locked and cannot be renamed safely.".format(role, leaf_name(node))
+            )
+    except PivotMatchError:
+        raise
+    except Exception:
+        pass
+
+
+def _build_name_sync_plan(pairs, proxy_prefix):
+    prefix = _validate_sync_prefix(proxy_prefix)
+    plan = []
+    planned_destinations = set()
+
+    for pair in pairs:
+        target = pair["target"]["node"]
+        proxy = pair["proxy"]["node"]
+        target_leaf = leaf_name(target)
+        proxy_leaf = leaf_name(proxy)
+
+        if ":" in target_leaf or ":" in proxy_leaf:
+            raise PivotMatchError(
+                "Name sync does not support namespaces in V1.3: '{}' <= '{}'. Disable Sync Names or remove the namespace first.".format(
+                    target_leaf, proxy_leaf
+                )
+            )
+
+        _validate_renameable(target, "Target")
+        _validate_renameable(proxy, "Proxy")
+
+        base_name = proxy_leaf[len(prefix):] if proxy_leaf.startswith(prefix) else proxy_leaf
+        if not base_name:
+            raise PivotMatchError("Proxy '{}' has no usable base name.".format(proxy_leaf))
+
+        desired_target = base_name
+        desired_proxy = prefix + base_name
+        target_path = _desired_dag_path(target, desired_target)
+        proxy_path = _desired_dag_path(proxy, desired_proxy)
+
+        for current, desired_path, desired_leaf, role in (
+            (target, target_path, desired_target, "Target"),
+            (proxy, proxy_path, desired_proxy, "Proxy"),
+        ):
+            if desired_path != current and cmds.objExists(desired_path):
+                raise PivotMatchError(
+                    "Name conflict: {} '{}' cannot become '{}' because that sibling name already exists.".format(
+                        role, leaf_name(current), desired_leaf
+                    )
+                )
+            destination_key = (str(_dag_parent(current) or ""), desired_leaf)
+            if destination_key in planned_destinations and desired_path != current:
+                raise PivotMatchError(
+                    "Name conflict: multiple objects would become '{}' under the same parent.".format(desired_leaf)
+                )
+            planned_destinations.add(destination_key)
+
+        plan.append({
+            "target": target,
+            "proxy": proxy,
+            "target_name": desired_target,
+            "proxy_name": desired_proxy,
+        })
+
+    return plan
+
+
+def _rename_deepest_first(items, node_key, name_key):
+    results = []
+    for item in sorted(items, key=lambda entry: entry[node_key].count("|"), reverse=True):
+        node = item[node_key]
+        desired = item[name_key]
+        if leaf_name(node) == desired:
+            results.append((node, node))
+            continue
+        expected_path = _desired_dag_path(node, desired)
+        try:
+            cmds.rename(node, desired)
+        except Exception as exc:
+            raise PivotMatchError(
+                "Could not rename '{}' to '{}': {}".format(leaf_name(node), desired, exc)
+            )
+        if not cmds.objExists(expected_path):
+            raise PivotMatchError(
+                "Maya did not create the requested name '{}'. Use Undo immediately.".format(desired)
+            )
+        results.append((node, expected_path))
+    return results
+
+
+def _apply_name_sync(name_plan):
+    proxy_results = _rename_deepest_first(name_plan, "proxy", "proxy_name")
+    target_results = _rename_deepest_first(name_plan, "target", "target_name")
+    return {
+        "proxy_results": proxy_results,
+        "target_results": target_results,
+        "renamed_count": sum(1 for old, new in proxy_results + target_results if old != new),
+    }
 
 
 def bbox_center_size(bounds):
@@ -564,7 +703,7 @@ def _round_bounds(bounds):
     return tuple(round(float(value), 6) for value in bounds)
 
 
-def _analysis_signature(target_records, proxy_records, pairs):
+def _analysis_signature(target_records, proxy_records, pairs, sync_names=False, proxy_prefix=DEFAULT_SYNCED_PREFIX):
     targets = tuple(sorted(
         (
             record["node"],
@@ -589,18 +728,25 @@ def _analysis_signature(target_records, proxy_records, pairs):
         (pair["target"]["node"], pair["proxy"]["node"])
         for pair in pairs
     )
-    return (PROXY_ROOT, targets, proxies, mapping)
+    return (PROXY_ROOT, bool(sync_names), str(proxy_prefix), targets, proxies, mapping)
 
 
-def analyze_matches():
-    """Read-only analysis. No pivots or transforms are modified."""
+def analyze_matches(sync_names=False, proxy_prefix=DEFAULT_SYNCED_PREFIX):
+    """Read-only analysis. No pivots, transforms, or names are modified."""
     _require_cmds()
+    prefix = _validate_sync_prefix(proxy_prefix) if sync_names else str(proxy_prefix)
     targets = [_record(node) for node in _selected_targets()]
     proxies = [_record(node) for node in _proxy_mesh_transforms()]
     pairing = pair_targets_to_proxies(targets, proxies)
     unresolved = pairing["unresolved"]
     ready = bool(pairing["pairs"]) and not unresolved and len(pairing["pairs"]) == len(targets)
-    signature = _analysis_signature(targets, proxies, pairing["pairs"]) if ready else None
+    name_plan = []
+    if ready and sync_names:
+        name_plan = _build_name_sync_plan(pairing["pairs"], prefix)
+    signature = (
+        _analysis_signature(targets, proxies, pairing["pairs"], sync_names, prefix)
+        if ready else None
+    )
     return {
         "ready": ready,
         "pairs": pairing["pairs"],
@@ -608,6 +754,9 @@ def analyze_matches():
         "signature": signature,
         "target_count": len(targets),
         "proxy_count": len(proxies),
+        "sync_names": bool(sync_names),
+        "proxy_prefix": prefix,
+        "name_plan": name_plan,
     }
 
 
@@ -619,6 +768,16 @@ def analysis_lines(analysis):
         )
         for pair in analysis["pairs"]
     ]
+    if analysis.get("sync_names"):
+        for item in analysis.get("name_plan", []):
+            lines.append(
+                "NAME | {} -> {} | {} -> {}".format(
+                    leaf_name(item["target"]),
+                    item["target_name"],
+                    leaf_name(item["proxy"]),
+                    item["proxy_name"],
+                )
+            )
     lines.extend(
         "UNRESOLVED | {} | {}".format(leaf_name(node), reason)
         for node, reason in analysis["unresolved"]
@@ -626,12 +785,12 @@ def analysis_lines(analysis):
     return lines or ["No matches found."]
 
 
-def apply_matches(expected_signature):
-    """Apply exact Proxy coordinate values + Match Pivots for a previously analyzed selection."""
+def apply_matches(expected_signature, sync_names=False, proxy_prefix=DEFAULT_SYNCED_PREFIX):
+    """Apply exact Proxy coordinate values, pivots, and optional name synchronization."""
     if expected_signature is None:
         raise PivotMatchError("Analyze the selection before applying.")
 
-    analysis = analyze_matches()
+    analysis = analyze_matches(sync_names=sync_names, proxy_prefix=proxy_prefix)
     if not analysis["ready"]:
         raise PivotMatchError("Match analysis is no longer ready. Analyze again.")
     if analysis["signature"] != expected_signature:
@@ -648,11 +807,21 @@ def apply_matches(expected_signature):
             target = pair["target"]["node"]
             proxy = pair["proxy"]["node"]
 
-            # V1.2: directly write Proxy Channel Box T/R/S values and solve an
-            # offsetParentMatrix compensation so the Target world matrix stays exact.
+            # V1.2 behavior retained: directly write Proxy Channel Box T/R/S values
+            # and solve offsetParentMatrix compensation so Target world matrix stays exact.
             _rebalance_transform_values_with_offset_parent_matrix(target, proxy)
             applied += 1
-        return {"matched_count": applied, "pairs": analysis["pairs"]}
+
+        name_result = {"renamed_count": 0, "proxy_results": [], "target_results": []}
+        if analysis["sync_names"]:
+            name_result = _apply_name_sync(analysis["name_plan"])
+
+        return {
+            "matched_count": applied,
+            "renamed_count": name_result["renamed_count"],
+            "pairs": analysis["pairs"],
+            "name_result": name_result,
+        }
     except Exception as exc:
         raise PivotMatchError(
             "Pivot matching failed after {} successful item(s). "
@@ -698,8 +867,20 @@ def show():
         backgroundColor=(0.22, 0.22, 0.22),
         wordWrap=True,
     )
+    name_sync = cmds.checkBox(label="Sync Names", value=False)
+    prefix_row = cmds.rowLayout(numberOfColumns=2, adjustableColumn=2, columnWidth2=(160, 360))
+    cmds.text(label="Proxy synced prefix", align="left")
+    prefix_field = cmds.textField(text=DEFAULT_SYNCED_PREFIX)
+    cmds.setParent(root)
+
     preview = cmds.textScrollList(numberOfRows=12, height=240)
     state = {"signature": None}
+
+    def options():
+        return (
+            bool(cmds.checkBox(name_sync, query=True, value=True)),
+            cmds.textField(prefix_field, query=True, text=True),
+        )
 
     def invalidate():
         state["signature"] = None
@@ -712,7 +893,8 @@ def show():
 
     def analyze(*_):
         try:
-            result = analyze_matches()
+            sync_names, proxy_prefix = options()
+            result = analyze_matches(sync_names=sync_names, proxy_prefix=proxy_prefix)
             cmds.textScrollList(preview, edit=True, removeAll=True)
             for line in analysis_lines(result):
                 cmds.textScrollList(preview, edit=True, append=line)
@@ -738,11 +920,19 @@ def show():
 
     def apply(*_):
         try:
-            result = apply_matches(state["signature"])
+            sync_names, proxy_prefix = options()
+            result = apply_matches(
+                state["signature"],
+                sync_names=sync_names,
+                proxy_prefix=proxy_prefix,
+            )
             invalidate()
+            suffix = " Names synchronized." if sync_names else ""
             _set_status(
                 status,
-                "Matched pivots + exact T/R/S values for {} final model(s).".format(result["matched_count"]),
+                "Matched pivots + exact T/R/S values for {} final model(s).{}".format(
+                    result["matched_count"], suffix
+                ),
                 True,
             )
         except PivotMatchError as exc:
@@ -751,7 +941,7 @@ def show():
 
     cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
     cmds.button(label="Analyze", height=38, command=analyze)
-    cmds.button(label="Apply Pivots + Coordinates V1.2", height=38, command=apply)
+    cmds.button(label="Apply Pivots + Coordinates V1.3", height=38, command=apply)
     cmds.setParent(root)
     cmds.text(
         label="If Apply reports a partial failure, use one Undo immediately.",
