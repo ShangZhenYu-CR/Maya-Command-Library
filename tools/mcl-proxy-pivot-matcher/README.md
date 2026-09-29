@@ -1,6 +1,6 @@
-# MCL Proxy Pivot Matcher — MCL-2 V1
+# MCL Proxy Pivot Matcher — MCL-2 V1.1
 
-Batch-match final-model pivots to corresponding proxy models.
+Batch-match final-model pivots **and Channel Box T/R/S values** to spatially corresponding proxy models.
 
 ## Maya workflow
 
@@ -9,8 +9,21 @@ Batch-match final-model pivots to corresponding proxy models.
 3. Select the final mesh transforms you want to update.
 4. Run the tool and click **Analyze**.
 5. Review the Target <= Proxy preview.
-6. If all targets resolve, click **Apply Match Pivots**.
-7. If needed, use one Maya Undo immediately to restore the batch.
+6. If all targets resolve, click **Apply Pivots + Coordinates**.
+7. Verify that the final model's Translate / Rotate / Scale values now match the Proxy while the final geometry remains visually stationary.
+8. If needed, use one Maya Undo immediately to restore the batch.
+
+## V1.1 behavior
+
+V1 only matched pivot information. V1.1 also synchronizes the Proxy's visible Channel Box:
+
+- Translate X/Y/Z
+- Rotate X/Y/Z
+- Scale X/Y/Z
+
+The tool uses Maya `move`, `rotate`, and `scale` with `preserveGeometryPosition=True` so the transform values can change while Maya applies the opposite compensation to geometry points. `preserveChildPosition=True` is also used for child transforms. After T/R/S synchronization, the tool runs `matchTransform(..., pivots=True)` to match the Proxy pivot.
+
+If Maya cannot set the Target channel values exactly, the batch stops and asks for Undo.
 
 ## Matching behavior
 
@@ -19,13 +32,17 @@ Batch-match final-model pivots to corresponding proxy models.
 - Selection order does not determine pairing.
 - Unused proxy objects are allowed.
 - Ambiguous, too-far, or size-mismatched targets block Apply.
+- Analyze signatures include Target / Proxy T/R/S values; changing those values after Analyze forces re-analysis.
 - Proxy objects are read-only sources.
 
-## Scene modification
+## Safety
 
-Apply calls Maya `matchTransform(target, proxy, pivots=True)` only.
-It does not request translation, rotation, or scale matching and does not rename,
-delete history, freeze transforms, soften edges, or write Maya global settings.
+- Full Apply uses one Undo chunk.
+- Locked / connected Target T/R/S channels block the operation before that Target is changed.
+- No rename.
+- No Delete History.
+- No Freeze Transform.
+- No global Maya settings changes.
 
 ## Installation
 
