@@ -143,3 +143,35 @@ duplicate_and_rotate_180()
 </details>
 
 **文件：** [`scripts/duplicate_rotate_180.py`](scripts/duplicate_rotate_180.py)
+
+---
+
+### 4. 选中模型坐标轴同步成活动模型
+
+**介绍：** 把其他选中物体的坐标轴（旋转/朝向）同步成当前活动物体（最后选中的那个）。使用 world 空间匹配旋转，让局部轴朝向一致。
+
+<details>
+<summary>点击展开代码（展开后可一键复制）</summary>
+
+```python
+import maya.cmds as cmds
+
+def sync_axes_to_active():
+    selected = cmds.ls(selection=True, type="transform")
+    if len(selected) < 2:
+        cmds.warning("请至少选中两个物体（最后选中的作为目标）！")
+        return
+    active = selected[-1]
+    sources = selected[:-1]
+    try:
+        cmds.matchTransform(sources, active, rotation=True)
+        print(f"已将 {len(sources)} 个物体的坐标轴同步到: {active}")
+    except Exception as e:
+        cmds.warning(f"同步失败: {e}")
+
+sync_axes_to_active()
+```
+
+</details>
+
+**文件：** [`scripts/sync_axes_to_active.py`](scripts/sync_axes_to_active.py)
