@@ -325,3 +325,89 @@ match_all_transforms_keep_mesh()
 </details>
 
 **文件：** [`scripts/match_all_transforms_keep_mesh.py`](scripts/match_all_transforms_keep_mesh.py)
+
+---
+
+### 6. 对齐模型：同步 Channel Box 并移动、旋转、缩放
+
+**介绍：** 将目标物体的位移、旋转、缩放、Shear、Rotate Axis、旋转顺序和枢轴属性同步成最后选中的参考物体。模型会随变换实际移动、旋转、缩放，不进行顶点反补偿；参考物体不修改。
+
+**用法：** 在物体模式下先选一个或多个目标，最后按住 Shift 选参考物体，将下方完整代码粘贴到 Maya Script Editor 的 Python 标签页运行。操作合并为一次 Undo。
+
+**条件：** 目标与参考须处于同一父级，Inherits Transform 状态和 Offset Parent Matrix 相同；目标不能是引用物体，待修改属性不能锁定或受驱动，且须开启 Maya Undo。
+
+**验证范围：** 已通过 Python 语法检查，尚未在 Maya 中完成运行验证。建议先在场景副本上试用。
+
+<details>
+<summary>点击展开代码（展开后可一键复制）</summary>
+
+```python
+import maya.cmds as cmds
+
+def align_model_to_last():
+    # 先选需要对齐的模型，最后 Shift 选参考物体。
+    selected = cmds.ls(sl=True, long=True) or []
+    if len(selected) < 2 or any(
+        cmds.nodeType(x) != "transform" for x in selected
+    ):
+        raise RuntimeError("请在物体模式下先选目标，最后选参考物体。")
+    if not cmds.undoInfo(q=True, state=True):
+        raise RuntimeError("请先开启 Maya Undo。")
+
+    reference = selected[-1]
+    targets = selected[:-1]
+    attrs = (
+        "translate", "rotate", "scale", "shear", "rotateAxis",
+        "rotatePivot", "scalePivot",
+        "rotatePivotTranslate", "scalePivotTranslate"
+    )
+    values = {
+        a: cmds.getAttr(reference + "." + a)[0] for a in attrs
+    }
+    order = cmds.getAttr(reference + ".rotateOrder")
+    parent = cmds.listRelatives(reference, parent=True, fullPath=True) or []
+
+    for obj in targets:
+        if (cmds.listRelatives(obj, parent=True, fullPath=True) or []) != parent:
+            raise RuntimeError("请让目标与参考处于同一父级：" + obj)
+        if cmds.referenceQuery(obj, isNodeReferenced=True):
+            raise RuntimeError("不修改引用物体：" + obj)
+        if cmds.getAttr(obj + ".inheritsTransform") != cmds.getAttr(
+            reference + ".inheritsTransform"
+        ):
+            raise RuntimeError("Inherits Transform 状态不同：" + obj)
+        if cmds.attributeQuery("offsetParentMatrix", node=obj, exists=True):
+            if cmds.getAttr(obj + ".offsetParentMatrix") != cmds.getAttr(
+                reference + ".offsetParentMatrix"
+            ):
+                raise RuntimeError("Offset Parent Matrix 不同：" + obj)
+        for attr in attrs + ("rotateOrder",):
+            children = cmds.attributeQuery(
+                attr, node=obj, listChildren=True) or [attr]
+            for child in children:
+                if not cmds.getAttr(obj + "." + child, settable=True):
+                    raise RuntimeError("属性被锁定或驱动：" + obj + "." + child)
+
+    changed = False
+    cmds.undoInfo(openChunk=True, chunkName="AlignModelToLast")
+    try:
+        for obj in targets:
+            cmds.setAttr(obj + ".rotateOrder", order)
+            changed = True
+            for attr in attrs:
+                cmds.setAttr(obj + "." + attr, *values[attr])
+        print("完成：目标的位移、旋转、缩放及坐标系已匹配参考。")
+    except Exception:
+        cmds.undoInfo(closeChunk=True)
+        if changed:
+            cmds.undo()
+        raise
+    else:
+        cmds.undoInfo(closeChunk=True)
+
+align_model_to_last()
+```
+
+</details>
+
+**文件：** [`scripts/align_model_to_last.py`](scripts/align_model_to_last.py)
