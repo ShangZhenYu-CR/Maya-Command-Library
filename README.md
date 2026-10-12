@@ -148,7 +148,7 @@ duplicate_and_rotate_180()
 
 ### 4. 选中模型坐标轴同步成活动模型
 
-**介绍：** 把其他选中物体的坐标轴（旋转/朝向）同步成当前活动物体（最后选中的那个）。使用 world 空间匹配旋转，让局部轴朝向一致。
+**介绍：** 把其他选中物体的坐标轴（旋转/朝向）同步成当前活动物体（最后选中的那个）。使用 world 空间直接设置旋转，更可靠。执行后会有视口提示。
 
 <details>
 <summary>点击展开代码（展开后可一键复制）</summary>
@@ -164,10 +164,24 @@ def sync_axes_to_active():
     active = selected[-1]
     sources = selected[:-1]
     try:
-        cmds.matchTransform(sources, active, rotation=True)
-        print(f"已将 {len(sources)} 个物体的坐标轴同步到: {active}")
+        target_rot = cmds.xform(active, query=True, worldSpace=True, rotation=True)
     except Exception as e:
-        cmds.warning(f"同步失败: {e}")
+        cmds.warning(f"无法获取目标旋转: {e}")
+        return
+    success_count = 0
+    for src in sources:
+        try:
+            cmds.xform(src, worldSpace=True, rotation=target_rot)
+            success_count += 1
+        except Exception as e:
+            cmds.warning(f"同步失败 {src}: {e}")
+    cmds.select(selected)
+    print(f"已将 {success_count} 个物体的坐标轴同步到: {active}")
+    cmds.inViewMessage(
+        amg=f'<hl>已同步 {success_count} 个物体的坐标轴</hl>',
+        pos='midCenter',
+        fade=True
+    )
 
 sync_axes_to_active()
 ```
