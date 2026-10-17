@@ -353,3 +353,48 @@ align_model_to_last()
 </details>
 
 **文件：** [`scripts/align_model_to_last.py`](scripts/align_model_to_last.py)
+
+---
+
+### 7. 解锁法线并软化边
+
+**介绍：** 对选中的 mesh 解锁法线（unFreezeNormal）并软化所有边（angle=180），然后删除建模历史。适用于修复硬边或锁定法线的模型。
+
+<details>
+<summary>点击展开代码（展开后可一键复制）</summary>
+
+```python
+import maya.cmds as cmds
+
+def unlock_normals_soften_edges():
+    sel = cmds.ls(selection=True, long=True)
+    if not sel:
+        cmds.warning("没有选中任何物体！")
+        return
+    processed = []
+    for obj in sel:
+        shapes = cmds.listRelatives(obj, shapes=True, fullPath=True)
+        if shapes:
+            try:
+                cmds.polyNormalPerVertex(shapes[0], unFreezeNormal=True)
+                cmds.polySoftEdge(obj, angle=180)
+                processed.append(obj)
+            except Exception as e:
+                cmds.warning(f"处理失败 {obj}: {e}")
+    if processed:
+        cmds.delete(processed, constructionHistory=True)
+        print(f"Normals unlocked + edges softened: {processed}")
+        cmds.inViewMessage(
+            amg=f'<hl>已解锁法线并软化边: {len(processed)} 个物体</hl>',
+            pos='midCenter',
+            fade=True
+        )
+    else:
+        cmds.warning("没有找到可处理的 mesh。")
+
+unlock_normals_soften_edges()
+```
+
+</details>
+
+**文件：** [`scripts/unlock_normals_soften_edges.py`](scripts/unlock_normals_soften_edges.py)
