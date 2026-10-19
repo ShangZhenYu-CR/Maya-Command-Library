@@ -398,3 +398,63 @@ unlock_normals_soften_edges()
 </details>
 
 **文件：** [`scripts/unlock_normals_soften_edges.py`](scripts/unlock_normals_soften_edges.py)
+
+---
+
+### 8. 重命名 UV 通道
+
+**介绍：** 重命名选中模型的 UV 通道。默认预设映射：map1 → map2、uv0 → uv1。可传入自定义字典手动指定任意旧名称到新名称的映射。运行时处理所有选中的 mesh。
+
+<details>
+<summary>点击展开代码（展开后可一键复制）</summary>
+
+```python
+import maya.cmds as cmds
+
+def rename_uv_channels(rename_map=None):
+    if rename_map is None:
+        rename_map = {"map1": "map2", "uv0": "uv1"}
+    sel = cmds.ls(selection=True, long=True)
+    if not sel:
+        cmds.warning("没有选中任何物体！")
+        return
+    success_count = 0
+    for obj in sel:
+        shapes = cmds.listRelatives(obj, shapes=True, fullPath=True, noIntermediate=True)
+        if not shapes or cmds.nodeType(shapes[0]) != "mesh":
+            continue
+        shape = shapes[0]
+        try:
+            uv_sets = cmds.polyUVSet(shape, query=True, allUVSets=True) or []
+        except Exception:
+            continue
+        for old_name in list(uv_sets):
+            if old_name in rename_map:
+                new_name = rename_map[old_name]
+                if new_name in uv_sets:
+                    print(f"跳过 {obj}: {new_name} 已存在")
+                    continue
+                try:
+                    cmds.polyUVSet(shape, rename=True, uvSet=old_name, newUVSet=new_name)
+                    print(f"{obj}: {old_name} → {new_name}")
+                    success_count += 1
+                    uv_sets.remove(old_name)
+                    uv_sets.append(new_name)
+                except Exception as e:
+                    cmds.warning(f"重命名失败 {obj} {old_name} → {new_name}: {e}")
+    if success_count:
+        print(f"已重命名 {success_count} 个 UV 通道")
+        cmds.inViewMessage(amg=f'<hl>已重命名 {success_count} 个 UV 通道</hl>', pos='midCenter', fade=True)
+    else:
+        cmds.warning("没有匹配到可重命名的 UV 通道。")
+
+# 使用预设
+rename_uv_channels()
+
+# 自定义示例：
+# rename_uv_channels({"map1": "uv0", "map2": "uv1"})
+```
+
+</details>
+
+**文件：** [`scripts/rename_uv_channels.py`](scripts/rename_uv_channels.py)
