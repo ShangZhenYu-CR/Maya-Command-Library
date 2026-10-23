@@ -288,7 +288,7 @@ def open_naming_tools_panel():
 
     # Replace prefix
     cmds.text(label="替换前缀", align="left", font="boldLabelFont")
-    cmds.rowLayout(numberOfColumns=3, columnWidth3=(100, 100, 160))
+    cmds.rowLayout(numberOfColumns=4, columnWidth4=(70, 100, 100, 100))
     cmds.text(label="旧 → 新:")
     old_p_field = cmds.textField("namingOldPrefix", text="old_", width=100)
     new_p_field = cmds.textField("namingNewPrefix", text="new_", width=100)
