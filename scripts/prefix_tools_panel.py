@@ -30,9 +30,10 @@ def add_custom_prefix(prefix):
         cmds.warning("没有物体被修改。")
 
 
-def transfer_name_without_prefix(prefix):
+def transfer_name_without_prefix(prefix, hide_after=False):
     """选中两个物体：一个带前缀、一个不带。
     把带前缀的名字去掉前缀后，赋给不带前缀的那个。
+    hide_after: 命名后是否隐藏这两个物体。
     """
     if not prefix:
         cmds.warning("前缀不能为空！")
@@ -72,6 +73,11 @@ def transfer_name_without_prefix(prefix):
             amg=f'<hl>已赋予名称: {new_name}</hl>',
             pos='midCenter', fade=True
         )
+        # 命名后隐藏（两个都藏，或只藏带前缀的那个）
+        if hide_after:
+            to_hide = [prefixed, result]
+            cmds.hide(to_hide)
+            print(f"已隐藏: {to_hide}")
         cmds.select(result)
     except Exception as e:
         cmds.warning(f"重命名失败: {e}")
@@ -81,16 +87,16 @@ def open_prefix_tools_panel():
     if cmds.window("prefixToolsPanel", exists=True):
         cmds.deleteUI("prefixToolsPanel")
 
-    win = cmds.window("prefixToolsPanel", title="前缀工具", widthHeight=(340, 260))
+    win = cmds.window("prefixToolsPanel", title="前缀工具", widthHeight=(360, 300))
     cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=("both", 12))
 
     cmds.text(label="前缀名称（两个功能都认这个前缀）", align="left", font="boldLabelFont")
-    cmds.rowLayout(numberOfColumns=2, columnWidth2=(70, 220))
+    cmds.rowLayout(numberOfColumns=2, columnWidth2=(70, 240))
     cmds.text(label="前缀:")
-    prefix_field = cmds.textField("prefixField", text="old_", width=220)
+    prefix_field = cmds.textField("prefixField", text="old_", width=240)
     cmds.setParent("..")
 
-    cmds.rowLayout(numberOfColumns=4, columnWidth4=(70, 70, 70, 70))
+    cmds.rowLayout(numberOfColumns=4, columnWidth4=(75, 75, 75, 75))
     cmds.button(label="old_", command=lambda x: cmds.textField(prefix_field, e=True, text="old_"))
     cmds.button(label="new_", command=lambda x: cmds.textField(prefix_field, e=True, text="new_"))
     cmds.button(label="temp_", command=lambda x: cmds.textField(prefix_field, e=True, text="temp_"))
@@ -100,14 +106,21 @@ def open_prefix_tools_panel():
     def get_prefix():
         return cmds.textField(prefix_field, query=True, text=True).strip()
 
+    # 命名后隐藏选项
+    hide_check = cmds.checkBox("hideAfterCheck", label="命名后隐藏这两个物体", value=False)
+
     cmds.separator(height=10, style="in")
     cmds.button(label="给选中物体添加前缀", height=36,
                 command=lambda x: add_custom_prefix(get_prefix()))
-    cmds.button(label="选中两个：去掉前缀赋予名字", height=36,
-                command=lambda x: transfer_name_without_prefix(get_prefix()))
 
-    cmds.text(label="添加前缀：选中任意物体
-赋予名字：正好选中两个（一个带前缀，一个不带）",
+    def do_transfer(*args):
+        hide = cmds.checkBox(hide_check, query=True, value=True)
+        transfer_name_without_prefix(get_prefix(), hide_after=hide)
+
+    cmds.button(label="选中两个：去掉前缀赋予名字", height=36,
+                command=do_transfer)
+
+    cmds.text(label="添加前缀：选中任意物体\n赋予名字：正好选中两个（一个带前缀，一个不带）\n勾选后会在赋予名字成功后隐藏这两个物体",
               align="center", font="smallPlainLabelFont")
 
     cmds.showWindow(win)
